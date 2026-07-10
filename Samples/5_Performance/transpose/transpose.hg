@@ -1,0 +1,568 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * transpose.hg -- Matrix Transpose: Native vs AIU+ldmatrix Throughput
+ *
+ * Compares two matrix transpose methods for bf16 square matrices:
+ *   1. Native: shared memory tiling (16x16 tiles, bank-conflict-free)
+ *   2. AIU+ldmatrix: AIU bulk copy to TSM + ldmatrix.swzl decode +
+ *      transposed store (64x64 tiles, 4 warps per tile)
+ *
+ * Tests multiple matrix sizes (64x64 to 256x256) to show scaling.
+ */
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+/* ── Configuration ─────────────────────────────────────────── */
+
+constexpr int TILE_NATIVE = 16;   // native kernel tile size
+constexpr int TILE_AIU_H  = 64;   // AIU tile rows
+constexpr int MAT_C       = 64;   // AIU channels (128B/row swizzle)
+constexpr int TILE_AIU_STRIP = 16; // rows per warp
+constexpr int N_WARPS     = TILE_AIU_H / TILE_AIU_STRIP; // 4
+constexpr int WARP_SZ     = 32;
+constexpr int BLK_SZ_AIU  = N_WARPS * WARP_SZ; // 128
+constexpr int N_LDMATRIX  = 4;   // 4 ldmatrix.swzl calls per strip
+
+/* Pipeline kernel: 1 producer + 4 consumers = 5 warps */
+constexpr int PIPE_WARPS       = N_WARPS + 1;     // 5
+constexpr int PIPE_N_CONSUMER  = N_WARPS;          // 4 (1 strip each, perfectly balanced)
+constexpr int PIPE_BLK_SZ      = PIPE_WARPS * WARP_SZ;  // 160
+
+static const int kTestSizes[] = {64, 1024, 4096, 8192, 16384};
+static const int kNumTests = 5;
+static const int kIterations = 1000;
+
+/* ── Kernel 1: Native shared-memory transpose ──────────────── */
+
+__global__ void native_transpose_kernel(
+    const uint16_t * __restrict__ input,
+    uint16_t * __restrict__ output,
+    int N)
+{
+    __shared__ uint16_t tile[TILE_NATIVE][TILE_NATIVE + 1]; // +1 to avoid bank conflicts
+
+    int bx = blockIdx.x * TILE_NATIVE;
+    int by = blockIdx.y * TILE_NATIVE;
+    int tx = threadIdx.x % TILE_NATIVE;
+    int ty = threadIdx.x / TILE_NATIVE;
+
+    /* Load tile from global (coalesced read) */
+    for (int i = 0; i < TILE_NATIVE; i += BLK_SZ_AIU / TILE_NATIVE) {
+        int row = ty + i;
+        if (row < TILE_NATIVE) {
+            tile[row][tx] = input[(by + row) * N + bx + tx];
+        }
+    }
+    __syncthreads();
+
+    /* Write transposed tile to global (coalesced write) */
+    int ox = by;  // output x = input y (transpose)
+    int oy = bx;  // output y = input x
+
+    for (int i = 0; i < TILE_NATIVE; i += BLK_SZ_AIU / TILE_NATIVE) {
+        int row = ty + i;
+        if (row < TILE_NATIVE) {
+            output[(oy + row) * N + ox + tx] = tile[tx][row];
+        }
+    }
+}
+
+/* ── Kernel 2: AIU + ldmatrix.swzl transpose ───────────────── */
+
+__global__ void aiu_transpose_kernel(
+    const uint16_t * __restrict__ input,
+    uint16_t * __restrict__ output,
+    int N)
+{
+    int warpIdx = threadIdx.x / WARP_SZ;
+    int lane    = threadIdx.x % WARP_SZ;
+
+    int tile_row = blockIdx.y * TILE_AIU_H;
+    int tile_col = blockIdx.x * TILE_AIU_H;  // square tiles
+
+    extern __shared__ __align__(128) uint16_t smem[];
+    int strip_elem = TILE_AIU_STRIP * MAT_C;  // 16*64 = 1024
+    uint16_t *my_smem = smem + warpIdx * strip_elem;
+
+    unsigned int my_smem_addr;
+    asm("ppu.cvta.to.shared.u32 %0, %1;"
+        : "=r"(my_smem_addr) : "l"(my_smem));
+
+    /* Phase 1: AIU async copy (global → TSM, swizzle 128B) */
+    /* dim_w = N/64 so stride_h = dim_w * dim_c = (N/64)*64 = N (matches row stride) */
+    int dim_w = N / MAT_C;
+    int start_w = tile_col / MAT_C;
+    if (lane == 0) {
+        int start_h = tile_row + warpIdx * TILE_AIU_STRIP;
+        asm volatile(
+            "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
+            " [%0], [%1],"
+            " {%2, %3, %4, %5, %6, %7},"
+            " {%8, %9, %10, %11};"
+            :: "r"(my_smem_addr), "l"(input),
+               "r"(N),  "r"(dim_w), "r"(MAT_C),
+               "r"(start_h), "r"(start_w), "r"(0),
+               "r"(TILE_AIU_STRIP), "r"(1), "r"(MAT_C),
+               "r"(1));
+        asm volatile("ppu.cp.async.commit_group;");
+        asm volatile("ppu.cp.async.wait_group 0;");
+    }
+    __syncthreads();
+
+    /* Phase 2: ldmatrix.swzl decode (TSM → registers) */
+    unsigned int frag[N_LDMATRIX * 4];
+
+    #pragma unroll
+    for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+        int ch_off = iter * 32;
+        asm volatile(
+            "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
+            " {%0, %1, %2, %3}, [%4],"
+            " {%5, %6, %7, %8, %9, %10};"
+            : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
+              "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
+            : "r"(my_smem_addr),
+              "r"(0), "r"(0), "r"(TILE_AIU_STRIP), "r"(1),
+              "r"(1), "r"(ch_off));
+    }
+
+    /* Phase 3: Store to transposed position in global output */
+    /* Fragment layout (per ldmatrix.swzl m8n8.x4):
+     *   r_blk = lane/4, c_blk = lane%4
+     *   frag[0]: (r_blk, c_blk*2), (r_blk, c_blk*2+1)     → UL 8x8
+     *   frag[1]: (r_blk, 8+c_blk*2), (r_blk, 8+c_blk*2+1) → UR 8x8
+     *   frag[2]: (8+r_blk, c_blk*2), (8+r_blk, c_blk*2+1) → LL 8x8
+     *   frag[3]: (8+r_blk, 8+c_blk*2), (8+r_blk, 8+c_blk*2+1) → LR 8x8
+     *
+     * Original position: row = tile_row + warpIdx*16 + r_blk (+8)
+     *                   col = tile_col + ch_base + c_blk*2 (+8)
+     * Transposed:        output_row = tile_col + ch_base + c_blk*2 (+8)
+     *                   output_col = tile_row + warpIdx*16 + r_blk (+8)
+     */
+    int r_blk = lane / 4;
+    int c_blk = lane % 4;
+    int base_row = tile_row + warpIdx * TILE_AIU_STRIP;
+
+    #pragma unroll
+    for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+        int ch_base = iter * 16;
+
+        output[(tile_col + ch_base + c_blk*2) * N + (base_row + r_blk)] =
+            static_cast<uint16_t>(frag[iter*4+0] & 0xFFFFu);
+        output[(tile_col + ch_base + c_blk*2 + 1) * N + (base_row + r_blk)] =
+            static_cast<uint16_t>((frag[iter*4+0] >> 16) & 0xFFFFu);
+
+        output[(tile_col + ch_base + 8 + c_blk*2) * N + (base_row + r_blk)] =
+            static_cast<uint16_t>(frag[iter*4+1] & 0xFFFFu);
+        output[(tile_col + ch_base + 8 + c_blk*2 + 1) * N + (base_row + r_blk)] =
+            static_cast<uint16_t>((frag[iter*4+1] >> 16) & 0xFFFFu);
+
+        output[(tile_col + ch_base + c_blk*2) * N + (base_row + 8 + r_blk)] =
+            static_cast<uint16_t>(frag[iter*4+2] & 0xFFFFu);
+        output[(tile_col + ch_base + c_blk*2 + 1) * N + (base_row + 8 + r_blk)] =
+            static_cast<uint16_t>((frag[iter*4+2] >> 16) & 0xFFFFu);
+
+        output[(tile_col + ch_base + 8 + c_blk*2) * N + (base_row + 8 + r_blk)] =
+            static_cast<uint16_t>(frag[iter*4+3] & 0xFFFFu);
+        output[(tile_col + ch_base + 8 + c_blk*2 + 1) * N + (base_row + 8 + r_blk)] =
+            static_cast<uint16_t>((frag[iter*4+3] >> 16) & 0xFFFFu);
+    }
+}
+
+/* ── Kernel 3: AIU pipeline (producer-consumer, double buffer) ── */
+/*
+ * Warp 0 (producer): AIU copy 4 strips to double-buffered TSM
+ *   - Uses ppu.cp.async.awbar.arrive to link AIU copy to full barrier
+ *   - ppu.awbar.arrive double-call pattern
+ * Warp 1-4 (consumers): ldmatrix.swzl from TSM -> transposed global write
+ *   - Each consumer warp handles exactly 1 strip (perfectly balanced)
+ * Sync: awbarrier parity-based (full/empty per buffer)
+ *   - Parity: buf_iter = t/2, producer_empty=(buf_iter+1)&1, consumer_full=buf_iter&1
+ *   - full barriers: count=1, empty barriers: count=PIPE_N_CONSUMER
+ *   - init completes phase 1 -> producer first wait passes immediately
+ */
+
+constexpr int N_BARS = 4;  // full_A, empty_A, full_B, empty_B
+
+__global__ void aiu_pipeline_transpose_kernel(
+    const uint16_t * __restrict__ input,
+    uint16_t * __restrict__ output,
+    int N)
+{
+    int warpIdx = threadIdx.x / WARP_SZ;
+    int lane    = threadIdx.x % WARP_SZ;
+    bool is_producer = (warpIdx == 0);
+
+    int tile_row_base = blockIdx.y * TILE_AIU_H;
+    int tile_col_base = blockIdx.x * TILE_AIU_H;
+    int n_col_tiles = N / TILE_AIU_H;
+    int dim_w = N / MAT_C;
+
+    /* Double-buffered TSM (128B aligned) */
+    extern __shared__ __align__(128) uint16_t tsm_buf[];
+    constexpr int strip_elem = TILE_AIU_STRIP * MAT_C;  // 1024
+    constexpr int tile_tsm_elems = N_WARPS * strip_elem;  // 4096
+
+    unsigned int tsm_addrs[2];
+    asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(tsm_addrs[0]) : "l"(&tsm_buf[0]));
+    asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(tsm_addrs[1]) : "l"(&tsm_buf[tile_tsm_elems]));
+
+    /* awbarrier storage (4 barriers, 8 bytes each, 8-byte aligned) */
+    __shared__ __align__(8) unsigned long long awbar_storage[N_BARS];
+    unsigned int bar_addrs[N_BARS];
+    #pragma unroll
+    for (int i = 0; i < N_BARS; ++i)
+        asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(bar_addrs[i]) : "l"(&awbar_storage[i]));
+
+    /* Init barriers (thread 0 only) */
+    if (threadIdx.x == 0) {
+        /* full: count=1 (producer arrives via cp.async.awbar.arrive + awbar.arrive) */
+        asm volatile("ppu.awbar.init.shared.b64 [%0], %1;" :: "r"(bar_addrs[0]), "r"(1));  /* full_A */
+        asm volatile("ppu.awbar.init.shared.b64 [%0], %1;" :: "r"(bar_addrs[2]), "r"(1));  /* full_B */
+        /* empty: count=PIPE_N_CONSUMER (each consumer warp lane 0 arrives) */
+        asm volatile("ppu.awbar.init.shared.b64 [%0], %1;" :: "r"(bar_addrs[1]), "r"(PIPE_N_CONSUMER));  /* empty_A */
+        asm volatile("ppu.awbar.init.shared.b64 [%0], %1;" :: "r"(bar_addrs[3]), "r"(PIPE_N_CONSUMER));  /* empty_B */
+    }
+    __syncthreads();
+
+    if (is_producer) {
+        /* ═══ Producer (warp 0): AIU copy -> TSM, signal full, wait empty ═══ */
+        for (int t = 0; t < n_col_tiles; ++t) {
+            int buf = t & 1;
+            int buf_iter = t / 2;
+            int full_idx = buf * 2;       /* 0 or 2 */
+            int empty_idx = buf * 2 + 1;  /* 1 or 3 */
+            int tile_col = tile_col_base + t * TILE_AIU_H;
+
+            /* Parity: (buf_iter+1)&1. First use: parity=1 (init completed phase 1, passes immediately) */
+            int empty_parity = (buf_iter + 1) & 1;
+
+            /* Wait for buffer empty (lane 0 only, then broadcast via __syncwarp) */
+            if (lane == 0) {
+                volatile int complete = 0;
+                do {
+                    asm volatile("ppu.awbar.test_wait.parity.shared.b64 %0, [%1], %2;"
+                        : "=r"(complete) : "r"(bar_addrs[empty_idx]), "r"(empty_parity));
+                } while (!complete);
+            }
+            __syncwarp();
+
+            /* AIU copy: 4 strips into TSM buffer, linked to full barrier */
+            if (lane == 0) {
+                for (int strip = 0; strip < N_WARPS; ++strip) {
+                    int start_h = tile_row_base + strip * TILE_AIU_STRIP;
+                    int start_w = tile_col / MAT_C;
+                    unsigned int dst = tsm_addrs[buf] + strip * strip_elem * sizeof(uint16_t);
+                    asm volatile(
+                        "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
+                        " [%0], [%1],"
+                        " {%2, %3, %4, %5, %6, %7},"
+                        " {%8, %9, %10, %11};"
+                        :: "r"(dst), "l"(input),
+                           "r"(N), "r"(dim_w), "r"(MAT_C),
+                           "r"(start_h), "r"(start_w), "r"(0),
+                           "r"(TILE_AIU_STRIP), "r"(1), "r"(MAT_C),
+                           "r"(1));
+                    /* Link this AIU copy to the full barrier (auto-arrive on completion) */
+                    asm volatile("ppu.cp.async.awbar.arrive.shared.b64 [%0];"
+                        :: "r"(bar_addrs[full_idx]));
+                }
+                /* Explicit arrive (double-call pattern) */
+                unsigned long long state;
+                asm volatile("ppu.awbar.arrive.shared.b64 %0, [%1];"
+                    : "=l"(state) : "r"(bar_addrs[full_idx]));
+            }
+            __syncwarp();
+        }
+    } else {
+        /* ═══ Consumers (warp 1-3): wait full, ldmatrix + global write, signal empty ═══ */
+        int cwarp = warpIdx - 1;  /* 0-2 */
+
+        for (int t = 0; t < n_col_tiles; ++t) {
+            int buf = t & 1;
+            int buf_iter = t / 2;
+            int full_idx = buf * 2;
+            int empty_idx = buf * 2 + 1;
+            int tile_col = tile_col_base + t * TILE_AIU_H;
+
+            /* Parity: buf_iter&1. First use: parity=0 (waits for producer to arrive) */
+            int full_parity = buf_iter & 1;
+
+            /* Wait for full (lane 0 only, then broadcast) */
+            if (lane == 0) {
+                volatile int complete = 0;
+                do {
+                    asm volatile("ppu.awbar.test_wait.parity.shared.b64 %0, [%1], %2;"
+                        : "=r"(complete) : "r"(bar_addrs[full_idx]), "r"(full_parity));
+                } while (!complete);
+            }
+            __syncwarp();
+
+            /* Consumer warp strip assignment: 4 consumers, 4 strips — 1 each! */
+            int my_strips = 1;
+            int my_strip_base = cwarp;
+
+            for (int s = 0; s < my_strips; ++s) {
+                int strip = my_strip_base + s;
+                unsigned int my_tsm_addr = tsm_addrs[buf] + strip * strip_elem * sizeof(uint16_t);
+
+                /* ldmatrix.swzl: TSM -> registers */
+                unsigned int frag[N_LDMATRIX * 4];
+                #pragma unroll
+                for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+                    int ch_off = iter * 32;
+                    asm volatile(
+                        "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
+                        " {%0, %1, %2, %3}, [%4],"
+                        " {%5, %6, %7, %8, %9, %10};"
+                        : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
+                          "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
+                        : "r"(my_tsm_addr),
+                          "r"(0), "r"(0), "r"(TILE_AIU_STRIP), "r"(1),
+                          "r"(1), "r"(ch_off));
+                }
+
+                /* Transposed global write */
+                int r_blk = lane / 4;
+                int c_blk = lane % 4;
+                int base_row = tile_row_base + strip * TILE_AIU_STRIP;
+
+                #pragma unroll
+                for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+                    int ch_base = iter * 16;
+
+                    output[(tile_col + ch_base + c_blk*2) * N + (base_row + r_blk)] =
+                        static_cast<uint16_t>(frag[iter*4+0] & 0xFFFFu);
+                    output[(tile_col + ch_base + c_blk*2 + 1) * N + (base_row + r_blk)] =
+                        static_cast<uint16_t>((frag[iter*4+0] >> 16) & 0xFFFFu);
+                    output[(tile_col + ch_base + 8 + c_blk*2) * N + (base_row + r_blk)] =
+                        static_cast<uint16_t>(frag[iter*4+1] & 0xFFFFu);
+                    output[(tile_col + ch_base + 8 + c_blk*2 + 1) * N + (base_row + r_blk)] =
+                        static_cast<uint16_t>((frag[iter*4+1] >> 16) & 0xFFFFu);
+                    output[(tile_col + ch_base + c_blk*2) * N + (base_row + 8 + r_blk)] =
+                        static_cast<uint16_t>(frag[iter*4+2] & 0xFFFFu);
+                    output[(tile_col + ch_base + c_blk*2 + 1) * N + (base_row + 8 + r_blk)] =
+                        static_cast<uint16_t>((frag[iter*4+2] >> 16) & 0xFFFFu);
+                    output[(tile_col + ch_base + 8 + c_blk*2) * N + (base_row + 8 + r_blk)] =
+                        static_cast<uint16_t>(frag[iter*4+3] & 0xFFFFu);
+                    output[(tile_col + ch_base + 8 + c_blk*2 + 1) * N + (base_row + 8 + r_blk)] =
+                        static_cast<uint16_t>((frag[iter*4+3] >> 16) & 0xFFFFu);
+                }
+            }
+
+            /* Signal empty (lane 0 of each consumer warp arrives) */
+            if (lane == 0) {
+                unsigned long long state;
+                asm volatile("ppu.awbar.arrive.shared.b64 %0, [%1];"
+                    : "=l"(state) : "r"(bar_addrs[empty_idx]));
+            }
+            __syncwarp();
+        }
+    }
+}
+
+/* ── Verification ──────────────────────────────────────────── */
+
+static bool verify_transpose(const uint16_t *out, const uint16_t *in, int N)
+{
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            if (out[j * N + i] != in[i * N + j]) {
+                if (i * N + j < 10)
+                    printf("  MISMATCH at out[%d][%d]=%d, in[%d][%d]=%d\n",
+                           j, i, out[j*N+i], i, j, in[i*N+j]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* ── Benchmark ─────────────────────────────────────────────── */
+
+static double bench_kernel(void (*launch)(const uint16_t*, uint16_t*, int, int),
+                           const uint16_t *d_in, uint16_t *d_out, int N,
+                           size_t smem, const char *name)
+{
+    launch(d_in, d_out, N, smem);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    hggcEvent_t t0, t1;
+    checkHggcErrors(hggcEventCreate(&t0));
+    checkHggcErrors(hggcEventCreate(&t1));
+    checkHggcErrors(hggcEventRecord(t0));
+    for (int i = 0; i < kIterations; i++)
+        launch(d_in, d_out, N, smem);
+    checkHggcErrors(hggcEventRecord(t1));
+    checkHggcErrors(hggcEventSynchronize(t1));
+    float ms = 0;
+    checkHggcErrors(hggcEventElapsedTime(&ms, t0, t1));
+    checkHggcErrors(hggcEventDestroy(t0));
+    checkHggcErrors(hggcEventDestroy(t1));
+
+    double ms_per = ms / kIterations;
+    double gbps = 2.0 * N * N * sizeof(uint16_t) / (ms_per * 1e-3 * 1e9);
+    printf("  %-22s  %8.2f GB/s  (%.4f ms)\n", name, gbps, ms_per);
+    return gbps;
+}
+
+/* ── Benchmark helper (inline) ─────────────────────────────── */
+
+static double time_kernel(const uint16_t *d_in, uint16_t *d_out, int N)
+{
+    hggcEvent_t t0, t1;
+    checkHggcErrors(hggcEventCreate(&t0));
+    checkHggcErrors(hggcEventCreate(&t1));
+    checkHggcErrors(hggcEventRecord(t0));
+    for (int i = 0; i < kIterations; i++)
+        ;  /* placeholder - kernel launched by caller */
+    checkHggcErrors(hggcEventRecord(t1));
+    checkHggcErrors(hggcEventSynchronize(t1));
+    float ms = 0;
+    checkHggcErrors(hggcEventElapsedTime(&ms, t0, t1));
+    checkHggcErrors(hggcEventDestroy(t0));
+    checkHggcErrors(hggcEventDestroy(t1));
+    double ms_per = ms / kIterations;
+    return 2.0 * N * N * sizeof(uint16_t) / (ms_per * 1e-3 * 1e9);
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[transpose] Native vs AIU+ldmatrix Transpose Throughput\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    printf("  Native tile: %dx%d, AIU tile: %dx%d\n\n",
+           TILE_NATIVE, TILE_NATIVE, TILE_AIU_H, TILE_AIU_H);
+
+    int max_n = kTestSizes[kNumTests - 1];
+    int max_bytes = max_n * max_n * sizeof(uint16_t);
+
+    uint16_t *h_in = new uint16_t[max_n * max_n];
+    for (int i = 0; i < max_n * max_n; i++)
+        h_in[i] = static_cast<uint16_t>((i * 2654435761u) >> 16);
+
+    uint16_t *d_in = nullptr, *d_out = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_in),  max_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out), max_bytes));
+
+    uint16_t *h_out = new uint16_t[max_n * max_n];
+    bool all_ok = true;
+
+    for (int t = 0; t < kNumTests; t++) {
+        int N = kTestSizes[t];
+        int bytes = N * N * sizeof(uint16_t);
+        checkHggcErrors(hggcMemcpy(d_in, h_in, bytes, hggcMemcpyHostToDevice));
+
+        /* --- Native --- */
+        dim3 n_grid(N / TILE_NATIVE, N / TILE_NATIVE);
+        dim3 n_block(TILE_NATIVE * TILE_NATIVE);
+        native_transpose_kernel<<<n_grid, n_block>>>(d_in, d_out, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+
+        hggcEvent_t nt0, nt1;
+        checkHggcErrors(hggcEventCreate(&nt0));
+        checkHggcErrors(hggcEventCreate(&nt1));
+        checkHggcErrors(hggcEventRecord(nt0));
+        for (int i = 0; i < kIterations; i++)
+            native_transpose_kernel<<<n_grid, n_block>>>(d_in, d_out, N);
+        checkHggcErrors(hggcEventRecord(nt1));
+        checkHggcErrors(hggcEventSynchronize(nt1));
+        float n_ms = 0;
+        checkHggcErrors(hggcEventElapsedTime(&n_ms, nt0, nt1));
+        checkHggcErrors(hggcEventDestroy(nt0));
+        checkHggcErrors(hggcEventDestroy(nt1));
+        double native_gbps = 2.0 * N * N * sizeof(uint16_t) / ((n_ms / kIterations) * 1e-3 * 1e9);
+
+        checkHggcErrors(hggcMemcpy(h_out, d_out, bytes, hggcMemcpyDeviceToHost));
+        bool native_ok = verify_transpose(h_out, h_in, N);
+
+        /* --- AIU + ldmatrix --- */
+        dim3 a_grid(N / TILE_AIU_H, N / TILE_AIU_H);
+        size_t aiu_smem = N_WARPS * TILE_AIU_STRIP * MAT_C * sizeof(uint16_t);
+        aiu_transpose_kernel<<<a_grid, BLK_SZ_AIU, aiu_smem>>>(d_in, d_out, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+
+        hggcEvent_t at0, at1;
+        checkHggcErrors(hggcEventCreate(&at0));
+        checkHggcErrors(hggcEventCreate(&at1));
+        checkHggcErrors(hggcEventRecord(at0));
+        for (int i = 0; i < kIterations; i++)
+            aiu_transpose_kernel<<<a_grid, BLK_SZ_AIU, aiu_smem>>>(d_in, d_out, N);
+        checkHggcErrors(hggcEventRecord(at1));
+        checkHggcErrors(hggcEventSynchronize(at1));
+        float a_ms = 0;
+        checkHggcErrors(hggcEventElapsedTime(&a_ms, at0, at1));
+        checkHggcErrors(hggcEventDestroy(at0));
+        checkHggcErrors(hggcEventDestroy(at1));
+        double aiu_gbps = 2.0 * N * N * sizeof(uint16_t) / ((a_ms / kIterations) * 1e-3 * 1e9);
+
+        checkHggcErrors(hggcMemcpy(h_out, d_out, bytes, hggcMemcpyDeviceToHost));
+        bool aiu_ok = verify_transpose(h_out, h_in, N);
+
+        if (!native_ok || !aiu_ok) all_ok = false;
+
+        printf("  %dx%-5d %6dKB  %-22s  %8.2f GB/s  %s\n",
+               N, N, bytes / 1024, "native (smem tile)", native_gbps,
+               native_ok ? "OK" : "FAIL");
+        printf("  %-8s  %8s  %-22s  %8.2f GB/s  %s\n",
+               "", "", "AIU+ldmatrix.swzl", aiu_gbps,
+               aiu_ok ? "OK" : "FAIL");
+
+
+        /* --- AIU pipeline (producer-consumer) --- */
+        size_t pipe_smem = 2 * N_WARPS * TILE_AIU_STRIP * MAT_C * sizeof(uint16_t);
+        dim3 p_grid(1, N / TILE_AIU_H);
+        aiu_pipeline_transpose_kernel<<<p_grid, PIPE_BLK_SZ, pipe_smem>>>(d_in, d_out, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+
+        hggcEvent_t pt0, pt1;
+        checkHggcErrors(hggcEventCreate(&pt0));
+        checkHggcErrors(hggcEventCreate(&pt1));
+        checkHggcErrors(hggcEventRecord(pt0));
+        for (int i = 0; i < kIterations; i++)
+            aiu_pipeline_transpose_kernel<<<p_grid, PIPE_BLK_SZ, pipe_smem>>>(d_in, d_out, N);
+        checkHggcErrors(hggcEventRecord(pt1));
+        checkHggcErrors(hggcEventSynchronize(pt1));
+        float p_ms = 0;
+        checkHggcErrors(hggcEventElapsedTime(&p_ms, pt0, pt1));
+        checkHggcErrors(hggcEventDestroy(pt0));
+        checkHggcErrors(hggcEventDestroy(pt1));
+        double pipe_gbps = 2.0 * N * N * sizeof(uint16_t) / ((p_ms / kIterations) * 1e-3 * 1e9);
+
+        checkHggcErrors(hggcMemcpy(h_out, d_out, bytes, hggcMemcpyDeviceToHost));
+        bool pipe_ok = verify_transpose(h_out, h_in, N);
+
+        if (!pipe_ok) all_ok = false;
+
+        printf("  %-8s  %8s  %-22s  %8.2f GB/s  %s\n",
+               "", "", "AIU pipeline", pipe_gbps,
+               pipe_ok ? "OK" : "FAIL");
+        printf("  Speedup (pipeline / native): %.2fx\n\n", pipe_gbps / native_gbps);
+    }
+
+    printf("  Result: %s\n", all_ok ? "PASS" : "FAIL");
+
+    delete[] h_in;
+    delete[] h_out;
+    checkHggcErrors(hggcFree(d_in));
+    checkHggcErrors(hggcFree(d_out));
+
+    return all_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

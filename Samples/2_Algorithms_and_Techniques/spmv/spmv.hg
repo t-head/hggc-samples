@@ -1,0 +1,262 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * spmv -- CSR Sparse Matrix-Vector Multiply (y = A * x)
+ *
+ * Demonstrates two PPU parallelization strategies for SpMV on CSR format:
+ *
+ *   1. Scalar (one thread per row):
+ *      Simplest approach.  Each thread iterates over one row's non-zeros.
+ *      Works well for matrices with uniform row lengths but suffers from
+ *      load imbalance when row lengths vary widely.
+ *
+ *   2. Vector (one warp per row):
+ *      Each warp cooperatively processes one row using parallel reduction.
+ *      Better for matrices with long, variable-length rows (e.g. power-law
+ *      graphs) because all lanes in a warp stay active together.
+ *
+ * The sample generates a synthetic banded sparse matrix, runs both kernels,
+ * and validates against a CPU reference.
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int kBlockSize = 256;
+constexpr int WARP_SIZE  = 32;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 1: Scalar SpMV -- one thread per row
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void spmv_scalar(
+    const int   * __restrict__ row_ptr,
+    const int   * __restrict__ col_idx,
+    const float * __restrict__ values,
+    const float * __restrict__ x,
+    float       * __restrict__ y,
+    int num_rows)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= num_rows) return;
+
+    float sum = 0.0f;
+    int start = row_ptr[row];
+    int end   = row_ptr[row + 1];
+    for (int j = start; j < end; ++j) {
+        sum += values[j] * x[col_idx[j]];
+    }
+    y[row] = sum;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 2: Vector SpMV -- one warp per row
+// ═══════════════════════════════════════════════════════════════════════
+// All 32 lanes in a warp collaborate on the same row.
+// Each lane processes elements at stride WARP_SIZE, then warp-reduces.
+
+__global__ void spmv_vector(
+    const int   * __restrict__ row_ptr,
+    const int   * __restrict__ col_idx,
+    const float * __restrict__ values,
+    const float * __restrict__ x,
+    float       * __restrict__ y,
+    int num_rows)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane    = threadIdx.x % WARP_SIZE;
+
+    if (warp_id >= num_rows) return;
+
+    int start = row_ptr[warp_id];
+    int end   = row_ptr[warp_id + 1];
+
+    // Each lane accumulates a partial sum with stride WARP_SIZE.
+    float sum = 0.0f;
+    for (int j = start + lane; j < end; j += WARP_SIZE) {
+        sum += values[j] * x[col_idx[j]];
+    }
+
+    // Warp-level reduction via shuffle.
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+
+    // Lane 0 writes the final result.
+    if (lane == 0) {
+        y[warp_id] = sum;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CPU reference
+// ═══════════════════════════════════════════════════════════════════════
+
+static void spmv_cpu(
+    const int *row_ptr, const int *col_idx, const float *values,
+    const float *x, float *y, int num_rows)
+{
+    for (int row = 0; row < num_rows; ++row) {
+        float sum = 0.0f;
+        for (int j = row_ptr[row]; j < row_ptr[row + 1]; ++j) {
+            sum += values[j] * x[col_idx[j]];
+        }
+        y[row] = sum;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Generate a synthetic banded sparse matrix in CSR format
+// Each row i has non-zeros at columns max(0,i-BW) .. min(N-1,i+BW)
+// ═══════════════════════════════════════════════════════════════════════
+
+struct CSRMatrix {
+    int num_rows;
+    int num_cols;
+    int nnz;
+    int   *row_ptr;
+    int   *col_idx;
+    float *values;
+};
+
+static CSRMatrix generate_banded_matrix(int N, int bandwidth)
+{
+    CSRMatrix m;
+    m.num_rows = N;
+    m.num_cols = N;
+
+    m.row_ptr = (int *)malloc((N + 1) * sizeof(int));
+    // First pass: count nnz per row.
+    m.row_ptr[0] = 0;
+    for (int i = 0; i < N; ++i) {
+        int start_col = (i - bandwidth > 0) ? (i - bandwidth) : 0;
+        int end_col   = (i + bandwidth < N - 1) ? (i + bandwidth) : (N - 1);
+        m.row_ptr[i + 1] = m.row_ptr[i] + (end_col - start_col + 1);
+    }
+    m.nnz = m.row_ptr[N];
+
+    m.col_idx = (int *)malloc(m.nnz * sizeof(int));
+    m.values  = (float *)malloc(m.nnz * sizeof(float));
+
+    // Second pass: fill values.
+    for (int i = 0; i < N; ++i) {
+        int start_col = (i - bandwidth > 0) ? (i - bandwidth) : 0;
+        int end_col   = (i + bandwidth < N - 1) ? (i + bandwidth) : (N - 1);
+        int base = m.row_ptr[i];
+        for (int c = start_col; c <= end_col; ++c) {
+            int idx = base + (c - start_col);
+            m.col_idx[idx] = c;
+            m.values[idx]  = (c == i) ? 2.0f : -0.5f;  // diag-dominant
+        }
+    }
+    return m;
+}
+
+static void free_csr(CSRMatrix &m)
+{
+    free(m.row_ptr);
+    free(m.col_idx);
+    free(m.values);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[spmv] CSR Sparse Matrix-Vector Multiply\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    constexpr int N  = 8192;
+    constexpr int BW = 16;  // half-bandwidth -> ~33 nnz per row
+
+    // Generate matrix and vector.
+    CSRMatrix A = generate_banded_matrix(N, BW);
+    printf("  Matrix: %d x %d, nnz = %d (bandwidth = %d)\n", N, N, A.nnz, 2 * BW + 1);
+
+    float *h_x = (float *)malloc(N * sizeof(float));
+    for (int i = 0; i < N; ++i) h_x[i] = 1.0f;
+
+    // CPU reference.
+    float *h_ref = (float *)malloc(N * sizeof(float));
+    spmv_cpu(A.row_ptr, A.col_idx, A.values, h_x, h_ref, N);
+
+    // Device buffers.
+    int   *d_row_ptr, *d_col_idx;
+    float *d_values, *d_x, *d_y;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_row_ptr), (N + 1) * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_col_idx), A.nnz * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_values),  A.nnz * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_x), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_y), N * sizeof(float)));
+
+    checkHggcErrors(hggcMemcpy(d_row_ptr, A.row_ptr, (N + 1) * sizeof(int), hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_col_idx, A.col_idx, A.nnz * sizeof(int), hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_values,  A.values,  A.nnz * sizeof(float), hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_x, h_x, N * sizeof(float), hggcMemcpyHostToDevice));
+
+    float *h_out = (float *)malloc(N * sizeof(float));
+    bool all_pass = true;
+    HggcTimer timer;
+
+    // ---- Strategy 1: Scalar (one thread per row) ----
+    printf("\n  Strategy 1: Scalar (1 thread/row)\n");
+    checkHggcErrors(hggcMemset(d_y, 0, N * sizeof(float)));
+    timer.start();
+    int grid_scalar = (N + kBlockSize - 1) / kBlockSize;
+    spmv_scalar<<<grid_scalar, kBlockSize>>>(d_row_ptr, d_col_idx, d_values, d_x, d_y, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    checkHggcErrors(hggcMemcpy(h_out, d_y, N * sizeof(float), hggcMemcpyDeviceToHost));
+
+    float max_err1 = 0.0f;
+    for (int i = 0; i < N; ++i) max_err1 = fmaxf(max_err1, fabsf(h_out[i] - h_ref[i]));
+    bool pass1 = (max_err1 < 1e-4f);
+    printf("    %.3f ms  max_err=%e  %s\n", timer.elapsed(), max_err1, pass1 ? "PASS" : "FAIL");
+    all_pass = all_pass && pass1;
+
+    // ---- Strategy 2: Vector (one warp per row) ----
+    printf("  Strategy 2: Vector (1 warp/row)\n");
+    checkHggcErrors(hggcMemset(d_y, 0, N * sizeof(float)));
+    timer.reset(); timer.start();
+    int warps_needed = N;
+    int threads_needed = warps_needed * WARP_SIZE;
+    int grid_vector = (threads_needed + kBlockSize - 1) / kBlockSize;
+    spmv_vector<<<grid_vector, kBlockSize>>>(d_row_ptr, d_col_idx, d_values, d_x, d_y, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    checkHggcErrors(hggcMemcpy(h_out, d_y, N * sizeof(float), hggcMemcpyDeviceToHost));
+
+    float max_err2 = 0.0f;
+    for (int i = 0; i < N; ++i) max_err2 = fmaxf(max_err2, fabsf(h_out[i] - h_ref[i]));
+    bool pass2 = (max_err2 < 1e-4f);
+    printf("    %.3f ms  max_err=%e  %s\n", timer.elapsed(), max_err2, pass2 ? "PASS" : "FAIL");
+    all_pass = all_pass && pass2;
+
+    // Cleanup.
+    free(h_x); free(h_ref); free(h_out);
+    free_csr(A);
+    checkHggcErrors(hggcFree(d_row_ptr));
+    checkHggcErrors(hggcFree(d_col_idx));
+    checkHggcErrors(hggcFree(d_values));
+    checkHggcErrors(hggcFree(d_x));
+    checkHggcErrors(hggcFree(d_y));
+
+    printf("\n  Result: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

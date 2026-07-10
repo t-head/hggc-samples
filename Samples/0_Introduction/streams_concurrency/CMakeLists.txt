@@ -1,0 +1,2 @@
+add_executable(streams_concurrency streams_concurrency.hg)
+target_include_directories(streams_concurrency PRIVATE ${COMMON_DIR})

@@ -1,0 +1,7 @@
+add_subdirectory(acsolver_dn_lu_factorization)
+add_subdirectory(acdnn_conv_activation)
+add_subdirectory(hg_jpeg)
+add_subdirectory(hg_jpeg_encoder)
+add_subdirectory(jit_lto)
+add_subdirectory(simple_acblas_lu)
+add_subdirectory(simple_acfft)

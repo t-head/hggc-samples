@@ -1,0 +1,182 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+
+#include "hggc_fp16.h"
+#include "helper_hggc.h"
+
+#define NUM_OF_BLOCKS  128
+#define NUM_OF_THREADS 128
+
+namespace {
+
+constexpr int kBlockCount   = NUM_OF_BLOCKS;
+constexpr int kBlockThreads = NUM_OF_THREADS;
+constexpr int kPartialBytes = kBlockCount * static_cast<int>(sizeof(float));
+
+/// Populate a host half2 buffer with deterministic small integer values.
+void seed_half2(half2 *buf, size_t element_count, std::mt19937 &rng) {
+    std::uniform_int_distribution<int> low_dist(0, 3);
+    std::uniform_int_distribution<int> high_dist(0, 1);
+    for (size_t i = 0; i < element_count; ++i) {
+        half2 sample;
+        sample.x = static_cast<float>(low_dist(rng));
+        sample.y = static_cast<float>(high_dist(rng));
+        buf[i]   = sample;
+    }
+}
+
+/// Sum the per-block partial floats produced by a kernel pass.
+float reduce_partials(const float *partials, int block_count) {
+    float acc = 0.0f;
+    for (int i = 0; i < block_count; ++i) acc += partials[i];
+    return acc;
+}
+
+}  /// anonymous
+
+/// Inline butterfly reduction inside shared memory using FP16 intrinsics.
+__forceinline__ __device__ void block_reduce_intrinsics(half2 *scratch) {
+    if (threadIdx.x < 64) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x + 64]);
+    __syncthreads();
+    if (threadIdx.x < 32) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x + 32]);
+    __syncthreads();
+    if (threadIdx.x < 16) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x + 16]);
+    __syncthreads();
+    if (threadIdx.x <  8) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x +  8]);
+    __syncthreads();
+    if (threadIdx.x <  4) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x +  4]);
+    __syncthreads();
+    if (threadIdx.x <  2) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x +  2]);
+    __syncthreads();
+    if (threadIdx.x <  1) scratch[threadIdx.x] = __hadd2(scratch[threadIdx.x], scratch[threadIdx.x +  1]);
+    __syncthreads();
+}
+
+/// Same pattern but using the native overloaded operators on half2.
+__forceinline__ __device__ void block_reduce_native(half2 *scratch) {
+    if (threadIdx.x < 64) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x + 64];
+    __syncthreads();
+    if (threadIdx.x < 32) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x + 32];
+    __syncthreads();
+    if (threadIdx.x < 16) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x + 16];
+    __syncthreads();
+    if (threadIdx.x <  8) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x +  8];
+    __syncthreads();
+    if (threadIdx.x <  4) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x +  4];
+    __syncthreads();
+    if (threadIdx.x <  2) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x +  2];
+    __syncthreads();
+    if (threadIdx.x <  1) scratch[threadIdx.x] = scratch[threadIdx.x] + scratch[threadIdx.x +  1];
+    __syncthreads();
+}
+
+/// Per-block FP16 dot product using `__hfma2`; emits one float per block.
+__global__ void dot_kernel_intrinsics(const half2 *vec_a, const half2 *vec_b,
+                                      float *block_partials, size_t element_count) {
+    const int        stride = gridDim.x * blockDim.x;
+    __shared__ half2 scratch[kBlockThreads];
+
+    half2 acc = __float2half2_rn(0.0f);
+    scratch[threadIdx.x] = acc;
+    for (int i = threadIdx.x + blockDim.x + blockIdx.x; i < element_count; i += stride) {
+        acc = __hfma2(vec_a[i], vec_b[i], acc);
+    }
+    scratch[threadIdx.x] = acc;
+    __syncthreads();
+
+    block_reduce_intrinsics(scratch);
+    if (threadIdx.x == 0) {
+        const half2 reduced = scratch[0];
+        block_partials[blockIdx.x] = __low2float(reduced) + __high2float(reduced);
+    }
+}
+
+/// Per-block FP16 dot product using overloaded operators.
+__global__ void dot_kernel_native(const half2 *vec_a, const half2 *vec_b,
+                                  float *block_partials, size_t element_count) {
+    const int        stride = gridDim.x * blockDim.x;
+    __shared__ half2 scratch[kBlockThreads];
+
+    half2 acc(0.0f, 0.0f);
+    scratch[threadIdx.x] = acc;
+    for (int i = threadIdx.x + blockDim.x + blockIdx.x; i < element_count; i += stride) {
+        acc = vec_a[i] * vec_b[i] + acc;
+    }
+    scratch[threadIdx.x] = acc;
+    __syncthreads();
+
+    block_reduce_native(scratch);
+    if (threadIdx.x == 0) {
+        const half2 reduced = scratch[0];
+        block_partials[blockIdx.x] = static_cast<float>(reduced.y) + static_cast<float>(reduced.x);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    const int dev_id = findHggcDevice(argc, const_cast<const char **>(argv));
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+    if (dev_prop.major < 5 || (dev_prop.major == 5 && dev_prop.minor < 3)) {
+        std::printf("[fp16_dot_product] device cap below 5.3, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+
+    const size_t element_count = static_cast<size_t>(kBlockCount) * kBlockThreads * 16;
+    half2  *host_vec[2]   = {nullptr, nullptr};
+    half2  *dev_vec[2]    = {nullptr, nullptr};
+    float  *host_partials = nullptr;
+    float  *dev_partials  = nullptr;
+
+    for (int i = 0; i < 2; ++i) {
+        checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&host_vec[i]),
+                                       element_count * sizeof(half2)));
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_vec[i]),
+                                   element_count * sizeof(half2)));
+    }
+    checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&host_partials), kPartialBytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_partials),       kPartialBytes));
+
+    /// Seed and ship the inputs.
+    std::mt19937 rng(0x636f6465u);
+    for (int i = 0; i < 2; ++i) {
+        seed_half2(host_vec[i], element_count, rng);
+        checkHggcErrors(hggcMemcpy(dev_vec[i], host_vec[i],
+                                   element_count * sizeof(half2),
+                                   hggcMemcpyHostToDevice));
+    }
+
+    /// Path 1: native operator overloads.
+    dot_kernel_native<<<kBlockCount, kBlockThreads>>>(dev_vec[0], dev_vec[1], dev_partials, element_count);
+    checkHggcErrors(hggcMemcpy(host_partials, dev_partials, kPartialBytes, hggcMemcpyDeviceToHost));
+    const float dot_native = reduce_partials(host_partials, kBlockCount);
+    std::printf("    native operators : %f\n", dot_native);
+
+    /// Path 2: dedicated FP16 intrinsics.
+    dot_kernel_intrinsics<<<kBlockCount, kBlockThreads>>>(dev_vec[0], dev_vec[1], dev_partials, element_count);
+    checkHggcErrors(hggcMemcpy(host_partials, dev_partials, kPartialBytes, hggcMemcpyDeviceToHost));
+    const float dot_intrinsics = reduce_partials(host_partials, kBlockCount);
+    std::printf("    fp16 intrinsics  : %f\n", dot_intrinsics);
+
+    const bool ok = std::fabs(dot_intrinsics - dot_native) < 1.0e-5f;
+    std::printf("&&&& fp16_dot_product %s\n", ok ? "PASSED" : "FAILED");
+
+    for (int i = 0; i < 2; ++i) {
+        checkHggcErrors(hggcFree(dev_vec[i]));
+        checkHggcErrors(hggcFreeHost(host_vec[i]));
+    }
+    checkHggcErrors(hggcFree(dev_partials));
+    checkHggcErrors(hggcFreeHost(host_partials));
+
+    return EXIT_SUCCESS;
+}

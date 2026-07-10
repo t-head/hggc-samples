@@ -1,0 +1,335 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * stream_compact -- Stream Compaction (Conditional Filtering)
+ *
+ * Given an input array of unsigned integers, output only those elements
+ * that satisfy a predicate (is_prime), preserving relative order.
+ *
+ * Three progressively optimized strategies:
+ *   1. Naive atomic   -- each passing thread atomicAdds a global counter
+ *                        to get its output slot.  Simple but unordered.
+ *   2. Ballot+popc    -- warp-level __ballot_sync + __popc for intra-warp
+ *                        prefix, shared atomic for block offset, global
+ *                        atomic for grid offset.  Block-ordered output.
+ *   3. Two-pass scan  -- pass 1 writes per-element flags and computes a
+ *                        block-level exclusive prefix sum; pass 2 scatters
+ *                        with exact global offsets.  Fully ordered output.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+
+constexpr int N         = 65536;
+constexpr int BLOCK     = 256;
+constexpr int GRID      = (N + BLOCK - 1) / BLOCK;
+constexpr int WARP_SIZE = 32;
+
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Device predicate: trial-division primality test (small numbers only)
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __host__ bool is_prime(unsigned int n)
+{
+    if (n < 2) return false;
+    if (n < 4) return true;
+    if (n % 2 == 0 || n % 3 == 0) return false;
+    for (unsigned int i = 5; i * i <= n; i += 6) {
+        if (n % i == 0 || n % (i + 2) == 0) return false;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 1: Naive atomic compaction (unordered output)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void compact_naive(
+    const unsigned int * __restrict__ input,
+    unsigned int       * __restrict__ output,
+    int                * __restrict__ count,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int val = input[idx];
+    if (is_prime(val)) {
+        int pos = atomicAdd(count, 1);
+        output[pos] = val;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 2: Ballot + popc (block-ordered output)
+// ═══════════════════════════════════════════════════════════════════════
+// Within each warp, __ballot_sync collects which lanes pass the predicate.
+// __popc of (ballot & lanemask_lt) gives the intra-warp prefix offset.
+// A shared atomic accumulates the per-block count, then a global atomic
+// reserves the block's output base.
+
+__global__ void compact_ballot(
+    const unsigned int * __restrict__ input,
+    unsigned int       * __restrict__ output,
+    int                * __restrict__ count,
+    int n)
+{
+    __shared__ int block_offset;  // base output index for this block
+    __shared__ int block_count;   // total passing elements in this block
+
+    if (threadIdx.x == 0) block_count = 0;
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int val = (idx < n) ? input[idx] : 0;
+    bool pred = (idx < n) && is_prime(val);
+
+    // Warp-level ballot.
+    unsigned int ballot = __ballot_sync(0xFFFFFFFF, pred);
+    int warp_count = __popc(ballot);
+
+    // Lane 0 of each warp reserves space in block_count.
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp_base = 0;
+    if (lane == 0 && warp_count > 0) {
+        warp_base = atomicAdd(&block_count, warp_count);
+    }
+    // Broadcast warp_base from lane 0 to all lanes.
+    warp_base = __shfl_sync(0xFFFFFFFF, warp_base, 0);
+
+    __syncthreads();
+
+    // Thread 0 reserves the block's output range globally.
+    if (threadIdx.x == 0) {
+        block_offset = atomicAdd(count, block_count);
+    }
+    __syncthreads();
+
+    // Scatter: intra-warp offset = popcount of lanes below me that passed.
+    if (pred) {
+        unsigned int mask_lt = (1u << lane) - 1u;
+        int intra_warp = __popc(ballot & mask_lt);
+        output[block_offset + warp_base + intra_warp] = val;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 3: Two-pass scan compaction (fully ordered output)
+// ═══════════════════════════════════════════════════════════════════════
+// Pass 1: write per-element flag + block-level exclusive scan of flags.
+//          Each block writes its total to a per-block sums array.
+// Between passes: host-side prefix sum of block sums (simple for demo).
+// Pass 2: scatter elements using (block_prefix + local_scan) as index.
+
+__global__ void compact_scan_flags(
+    const unsigned int * __restrict__ input,
+    int                * __restrict__ flags,
+    int                * __restrict__ block_sums,
+    int n)
+{
+    __shared__ int s_scan[BLOCK];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int flag = (idx < n && is_prime(input[idx])) ? 1 : 0;
+
+    // Inclusive scan within block (simple sequential for clarity).
+    s_scan[threadIdx.x] = flag;
+    __syncthreads();
+
+    // Up-sweep (parallel prefix, Hillis-Steele style).
+    for (int offset = 1; offset < BLOCK; offset *= 2) {
+        int val = 0;
+        if (threadIdx.x >= offset)
+            val = s_scan[threadIdx.x - offset];
+        __syncthreads();
+        s_scan[threadIdx.x] += val;
+        __syncthreads();
+    }
+
+    // s_scan[threadIdx.x] is now inclusive prefix sum.
+    // Convert to exclusive: exclusive[i] = inclusive[i] - flag[i].
+    int exclusive = s_scan[threadIdx.x] - flag;
+
+    // Store exclusive scan result as the output offset within this block.
+    if (idx < n) flags[idx] = exclusive;
+
+    // Last thread writes block total.
+    if (threadIdx.x == BLOCK - 1) {
+        block_sums[blockIdx.x] = s_scan[BLOCK - 1];
+    }
+}
+
+__global__ void compact_scan_scatter(
+    const unsigned int * __restrict__ input,
+    unsigned int       * __restrict__ output,
+    const int          * __restrict__ flags,
+    const int          * __restrict__ block_prefixes,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int val = input[idx];
+    if (is_prime(val)) {
+        int pos = block_prefixes[blockIdx.x] + flags[idx];
+        output[pos] = val;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+/// CPU reference compaction.
+static int compact_cpu(unsigned int *out, const unsigned int *in, int n)
+{
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+        if (is_prime(in[i])) out[count++] = in[i];
+    }
+    return count;
+}
+
+/// Validate that all CPU-reference primes appear in PPU output (order may vary).
+static bool validate_unordered(const unsigned int *gpu, int gpu_count,
+                               const unsigned int *cpu, int cpu_count)
+{
+    if (gpu_count != cpu_count) return false;
+    // Sort both and compare (small enough to fit in memory).
+    unsigned int *g = (unsigned int *)malloc(gpu_count * sizeof(unsigned int));
+    unsigned int *c = (unsigned int *)malloc(cpu_count * sizeof(unsigned int));
+    memcpy(g, gpu, gpu_count * sizeof(unsigned int));
+    memcpy(c, cpu, cpu_count * sizeof(unsigned int));
+    // Simple sort for validation.
+    auto cmp = [](const void *a, const void *b) {
+        return (int)(*(unsigned int *)a) - (int)(*(unsigned int *)b);
+    };
+    qsort(g, gpu_count, sizeof(unsigned int), cmp);
+    qsort(c, cpu_count, sizeof(unsigned int), cmp);
+    bool ok = (memcmp(g, c, gpu_count * sizeof(unsigned int)) == 0);
+    free(g); free(c);
+    return ok;
+}
+
+/// Validate ordered output (must match CPU exactly).
+static bool validate_ordered(const unsigned int *gpu, int gpu_count,
+                             const unsigned int *cpu, int cpu_count)
+{
+    if (gpu_count != cpu_count) return false;
+    return memcmp(gpu, cpu, gpu_count * sizeof(unsigned int)) == 0;
+}
+
+int main(int argc, char **argv)
+{
+    printf("[stream_compact] Conditional filtering: extract primes from [0, %d)\n\n", N);
+
+    findHggcDevice(argc, (const char **)argv);
+
+    // Host input: [0, 1, 2, ..., N-1].
+    unsigned int *h_input = (unsigned int *)malloc(N * sizeof(unsigned int));
+    for (int i = 0; i < N; ++i) h_input[i] = (unsigned int)i;
+
+    // CPU reference.
+    unsigned int *h_ref = (unsigned int *)malloc(N * sizeof(unsigned int));
+    int ref_count = compact_cpu(h_ref, h_input, N);
+    printf("  CPU reference: %d primes found\n\n", ref_count);
+
+    // Device buffers.
+    unsigned int *d_input, *d_output;
+    int *d_count;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input),  N * sizeof(unsigned int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output), N * sizeof(unsigned int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_count),  sizeof(int)));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, N * sizeof(unsigned int), hggcMemcpyHostToDevice));
+
+    unsigned int *h_output = (unsigned int *)malloc(N * sizeof(unsigned int));
+    int h_count = 0;
+    bool all_pass = true;
+
+    HggcTimer timer;
+
+    // ---- Strategy 1: Naive atomic ----
+    printf("  Strategy 1: Naive atomic (unordered)\\n");
+    checkHggcErrors(hggcMemset(d_count, 0, sizeof(int)));
+    timer.start();
+    compact_naive<<<GRID, BLOCK>>>(d_input, d_output, d_count, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    checkHggcErrors(hggcMemcpy(&h_count, d_count, sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_output, d_output, h_count * sizeof(unsigned int), hggcMemcpyDeviceToHost));
+    bool ok1 = validate_unordered(h_output, h_count, h_ref, ref_count);
+    printf("    count=%d  %.3f ms  %s\n", h_count, timer.elapsed(), ok1 ? "PASS" : "FAIL");
+    all_pass = all_pass && ok1;
+
+    // ---- Strategy 2: Ballot + popc ----
+    printf("  Strategy 2: Ballot + popc (block-ordered)\n");
+    checkHggcErrors(hggcMemset(d_count, 0, sizeof(int)));
+    timer.reset(); timer.start();
+    compact_ballot<<<GRID, BLOCK>>>(d_input, d_output, d_count, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    checkHggcErrors(hggcMemcpy(&h_count, d_count, sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_output, d_output, h_count * sizeof(unsigned int), hggcMemcpyDeviceToHost));
+    bool ok2 = validate_unordered(h_output, h_count, h_ref, ref_count);
+    printf("    count=%d  %.3f ms  %s\n", h_count, timer.elapsed(), ok2 ? "PASS" : "FAIL");
+    all_pass = all_pass && ok2;
+
+    // ---- Strategy 3: Two-pass scan ----
+    printf("  Strategy 3: Two-pass scan (fully ordered)\n");
+    int *d_flags, *d_block_sums, *d_block_prefixes;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_flags), N * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_block_sums), GRID * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_block_prefixes), GRID * sizeof(int)));
+
+    timer.reset(); timer.start();
+
+    // Pass 1: compute flags + block-level scan.
+    compact_scan_flags<<<GRID, BLOCK>>>(d_input, d_flags, d_block_sums, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    // Host-side prefix sum of block sums (small: GRID elements).
+    int *h_block_sums = (int *)malloc(GRID * sizeof(int));
+    int *h_block_pfx  = (int *)malloc(GRID * sizeof(int));
+    checkHggcErrors(hggcMemcpy(h_block_sums, d_block_sums, GRID * sizeof(int), hggcMemcpyDeviceToHost));
+    h_block_pfx[0] = 0;
+    for (int i = 1; i < GRID; ++i) h_block_pfx[i] = h_block_pfx[i - 1] + h_block_sums[i - 1];
+    int total = h_block_pfx[GRID - 1] + h_block_sums[GRID - 1];
+    checkHggcErrors(hggcMemcpy(d_block_prefixes, h_block_pfx, GRID * sizeof(int), hggcMemcpyHostToDevice));
+
+    // Pass 2: scatter.
+    compact_scan_scatter<<<GRID, BLOCK>>>(d_input, d_output, d_flags, d_block_prefixes, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+
+    checkHggcErrors(hggcMemcpy(h_output, d_output, total * sizeof(unsigned int), hggcMemcpyDeviceToHost));
+    bool ok3 = validate_ordered(h_output, total, h_ref, ref_count);
+    printf("    count=%d  %.3f ms  %s\n", total, timer.elapsed(), ok3 ? "PASS" : "FAIL");
+    all_pass = all_pass && ok3;
+
+    // ---- Cleanup ----
+    free(h_input); free(h_ref); free(h_output);
+    free(h_block_sums); free(h_block_pfx);
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_output));
+    checkHggcErrors(hggcFree(d_count));
+    checkHggcErrors(hggcFree(d_flags));
+    checkHggcErrors(hggcFree(d_block_sums));
+    checkHggcErrors(hggcFree(d_block_prefixes));
+
+    printf("\n  Result: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

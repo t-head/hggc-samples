@@ -1,0 +1,172 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * stream_callback.hg -- Async stream callback with multi-threaded workloads
+ *
+ * Demonstrates hggcStreamAddCallback for asynchronous host notification.
+ * Multiple worker threads launch PPU kernels on separate streams; each
+ * stream's completion triggers a callback that verifies results and
+ * signals a std::atomic counter.
+ *
+ * Uses C++11 std::thread instead of custom threading wrappers.
+ */
+
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+
+namespace {
+
+constexpr int kNumWorkloads  = 8;
+constexpr int kElements      = 100000;
+constexpr int kThreads       = 512;
+constexpr float kScaleFactor = 3.0f;
+
+struct WorkloadTask {
+    int           task_id;
+    int           device_id;
+    float        *host_buf;
+    float        *dev_buf;
+    hggcStream_t  stream;
+    bool          verified;
+};
+
+std::atomic<int> g_completed{0};
+
+/* ── Device kernel: element-wise scale ─────────────────────── */
+
+__global__ void scale_kernel(float *data, int n, float factor)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        data[idx] *= factor;
+}
+
+/* ── Stream callback: verify + count ───────────────────────── */
+
+void HGGCRT_CB stream_complete_callback(hggcStream_t stream, hggcError_t status, void *user_data)
+{
+    (void)stream;
+    checkHggcErrors(status);
+
+    WorkloadTask *task = static_cast<WorkloadTask *>(user_data);
+
+    /* Spot-check results (data already copied back via async memcpy) */
+    task->verified = true;
+    for (int i = 0; i < 32; i++) {
+        float expected = static_cast<float>(task->task_id + i) * kScaleFactor;
+        if (task->host_buf[i] != expected) {
+            task->verified = false;
+            break;
+        }
+    }
+
+    /* Signal completion (cleanup done in main thread) */
+    g_completed.fetch_add(1, std::memory_order_release);
+}
+
+/* ── Worker thread: launch kernel + async copy + callback ──── */
+
+void run_workload(WorkloadTask *task)
+{
+    checkHggcErrors(hggcSetDevice(task->device_id));
+    checkHggcErrors(hggcStreamCreate(&task->stream));
+
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&task->dev_buf),
+                               kElements * sizeof(float)));
+    checkHggcErrors(hggcHostAlloc(reinterpret_cast<void **>(&task->host_buf),
+                                  kElements * sizeof(float),
+                                  hggcHostAllocPortable));
+
+    /* Initialize: task_id + index */
+    for (int i = 0; i < kElements; i++)
+        task->host_buf[i] = static_cast<float>(task->task_id + i);
+
+    /* H2D → kernel → D2H → callback */
+    checkHggcErrors(hggcMemcpyAsync(task->dev_buf, task->host_buf,
+                                    kElements * sizeof(float),
+                                    hggcMemcpyHostToDevice, task->stream));
+
+    int grid = (kElements + kThreads - 1) / kThreads;
+    scale_kernel<<<grid, kThreads, 0, task->stream>>>(
+        task->dev_buf, kElements, kScaleFactor);
+
+    checkHggcErrors(hggcMemcpyAsync(task->host_buf, task->dev_buf,
+                                    kElements * sizeof(float),
+                                    hggcMemcpyDeviceToHost, task->stream));
+
+    checkHggcErrors(hggcStreamAddCallback(task->stream,
+                                           stream_complete_callback, task, 0));
+}
+
+}  // namespace
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[stream_callback] Async Stream Callback Demo\n\n");
+
+    int num_devices = 0;
+    checkHggcErrors(hggcGetDeviceCount(&num_devices));
+    if (num_devices < 1) {
+        printf("  No HGGC-capable devices found.\n");
+        return EXIT_FAILURE;
+    }
+
+    printf("  Devices: %d\n", num_devices);
+    printf("  Workloads: %d\n", kNumWorkloads);
+    printf("  Kernel: out[i] = in[i] * %.1f\n\n", kScaleFactor);
+
+    /* Create workloads */
+    WorkloadTask tasks[kNumWorkloads];
+    for (int i = 0; i < kNumWorkloads; i++) {
+        tasks[i].task_id = i;
+        tasks[i].device_id = i % num_devices;
+        tasks[i].verified = false;
+    }
+
+    /* Launch worker threads */
+    std::thread threads[kNumWorkloads];
+    for (int i = 0; i < kNumWorkloads; i++)
+        threads[i] = std::thread(run_workload, &tasks[i]);
+
+    /* Wait for all callbacks to complete */
+    while (g_completed.load(std::memory_order_acquire) < kNumWorkloads)
+        std::this_thread::yield();
+
+    /* Join threads */
+    for (int i = 0; i < kNumWorkloads; i++)
+        threads[i].join();
+
+    /* Cleanup device resources */
+    for (int i = 0; i < kNumWorkloads; i++) {
+        checkHggcErrors(hggcSetDevice(tasks[i].device_id));
+        checkHggcErrors(hggcFree(tasks[i].dev_buf));
+        checkHggcErrors(hggcFreeHost(tasks[i].host_buf));
+        checkHggcErrors(hggcStreamDestroy(tasks[i].stream));
+    }
+
+    /* Report results */
+    int passed = 0;
+    for (int i = 0; i < kNumWorkloads; i++) {
+        printf("  Workload %d (device %d): %s\n",
+               i, tasks[i].device_id, tasks[i].verified ? "OK" : "FAIL");
+        if (tasks[i].verified) passed++;
+    }
+
+    printf("\n  %d/%d workloads passed\n", passed, kNumWorkloads);
+    printf("  Result: %s\n", passed == kNumWorkloads ? "PASS" : "FAIL");
+
+    return (passed == kNumWorkloads) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

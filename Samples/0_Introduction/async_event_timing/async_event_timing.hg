@@ -1,0 +1,110 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_profiler_api.h>
+#include <hggc_runtime.h>
+
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+namespace {
+
+constexpr int kElementCount = 16 * 1024 * 1024;
+constexpr int kIncrementBy  = 26;
+constexpr int kBlockThreads = 512;
+
+/// Verify every element matches the expected post-increment value.
+bool verify_increment(const int *buf, int element_count, int expected) {
+    for (int i = 0; i < element_count; ++i) {
+        if (buf[i] != expected) {
+            std::printf("    mismatch @ %d: got %d expected %d\n", i, buf[i], expected);
+            return false;
+        }
+    }
+    return true;
+}
+
+}  /// anonymous
+
+/// Per-thread increment of the input array by `step`.
+__global__ void increment_kernel(int *dev_data, int step) {
+    const int slot     = blockIdx.x * blockDim.x + threadIdx.x;
+    dev_data[slot]     = dev_data[slot] + step;
+}
+
+int main(int argc, char *argv[]) {
+    std::printf("[async_event_timing] starting\n");
+
+    const int dev_id = findHggcDevice(argc, const_cast<const char **>(argv));
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+    std::printf("    selected device: %s\n", dev_prop.name);
+
+    const int    element_count = kElementCount;
+    const size_t byte_count    = element_count * sizeof(int);
+
+    /// Pinned host buffer + zeroed device buffer.
+    int *host_buf = nullptr;
+    checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&host_buf), byte_count));
+    std::memset(host_buf, 0, byte_count);
+
+    int *dev_buf = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_buf), byte_count));
+    checkHggcErrors(hggcMemset(dev_buf, 255, byte_count));
+
+    const dim3 block_dim(kBlockThreads, 1);
+    const dim3 grid_dim(element_count / block_dim.x, 1);
+
+    /// Build event handles for PPU-side timing.
+    hggcEvent_t evt_begin = nullptr;
+    hggcEvent_t evt_end   = nullptr;
+    checkHggcErrors(hggcEventCreate(&evt_begin));
+    checkHggcErrors(hggcEventCreate(&evt_end));
+
+    HggcTimer timer;
+    timer.reset();
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /// Pipeline: H2D + kernel + D2H, all on the default stream.
+    checkHggcErrors(hggcProfilerStart());
+    timer.start();
+    hggcEventRecord(evt_begin, 0);
+    hggcMemcpyAsync(dev_buf, host_buf, byte_count, hggcMemcpyHostToDevice, 0);
+    increment_kernel<<<grid_dim, block_dim, 0, 0>>>(dev_buf, kIncrementBy);
+    hggcMemcpyAsync(host_buf, dev_buf, byte_count, hggcMemcpyDeviceToHost, 0);
+    hggcEventRecord(evt_end, 0);
+    timer.stop();
+    checkHggcErrors(hggcProfilerStop());
+
+    /// Useful host-side work proxy: just spin until the PPU is done.
+    unsigned long host_iters = 0;
+    while (hggcEventQuery(evt_end) == hggcErrorNotReady) {
+        ++host_iters;
+    }
+
+    float ppu_ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&ppu_ms, evt_begin, evt_end));
+
+    std::printf("    PPU busy        : %.2f ms\n", ppu_ms);
+    std::printf("    CPU in HGGC API : %.2f ms\n", timer.elapsed());
+    std::printf("    CPU spin iters  : %lu\n", host_iters);
+
+    const bool ok = verify_increment(host_buf, element_count, kIncrementBy);
+
+    checkHggcErrors(hggcEventDestroy(evt_begin));
+    checkHggcErrors(hggcEventDestroy(evt_end));
+    checkHggcErrors(hggcFreeHost(host_buf));
+    checkHggcErrors(hggcFree(dev_buf));
+
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

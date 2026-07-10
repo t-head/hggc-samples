@@ -1,0 +1,257 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * simple_acfft -- Spectrum Analysis and Frequency Domain Filtering via ACFFT
+ *
+ * Generates a composite signal (sum of sine waves + noise), transforms to
+ * frequency domain, analyzes the spectrum to detect dominant frequencies,
+ * applies a low-pass filter, and reconstructs the filtered signal.
+ *
+ * Pipeline:
+ *   1. Build composite signal on host (3 sine waves + white noise)
+ *   2. acfftExecC2C forward FFT on device
+ *   3. Device kernel: compute magnitude spectrum, find peak bins
+ *   4. Device kernel: apply brick-wall low-pass filter
+ *   5. acfftExecC2C inverse FFT on device
+ *   6. Copy back, compare with CPU DFT reference
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <acfft.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+/* ── Configuration ───────────────────────────────────────────── */
+
+#define N_SAMPLES    256          /* Must be power of 2 */
+#define PI           3.14159265358979323846f
+
+/* Signal composition: 3 sine waves at known frequencies */
+#define FREQ_0       5            /* bins */
+#define FREQ_1       20
+#define FREQ_2       50
+#define NOISE_AMP    0.3f
+
+/* Low-pass filter cutoff (keep bins 0..CUTOFF and N-CUTOFF..N-1) */
+#define CUTOFF       30
+
+/* Tolerance for verification */
+#define TOL          1e-4f
+
+/* ── Device kernels ──────────────────────────────────────────── */
+
+/* Compute magnitude spectrum and find top-K peak bins */
+__global__ void compute_magnitude(
+    const acfftComplex *freq, float *mag, int n)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        float re = freq[tid].x;
+        float im = freq[tid].y;
+        mag[tid] = sqrtf(re * re + im * im);
+    }
+}
+
+/* Apply brick-wall low-pass filter in frequency domain.
+ * Bins [0, cutoff) and (N-cutoff, N-1] are kept; others zeroed.
+ */
+__global__ void apply_lowpass(acfftComplex *freq, int n, int cutoff)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        if (tid > cutoff && tid < n - cutoff) {
+            freq[tid].x = 0.0f;
+            freq[tid].y = 0.0f;
+        }
+    }
+}
+
+/* ── Host helper functions ───────────────────────────────────── */
+
+/* Generate a composite signal: sum of sine waves + noise */
+static void generate_signal(float *signal, int n)
+{
+    srand(42);
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / n;
+        signal[i] = 1.0f * sinf(2.0f * PI * FREQ_0 * t)
+                  + 0.7f * sinf(2.0f * PI * FREQ_1 * t)
+                  + 0.5f * sinf(2.0f * PI * FREQ_2 * t)
+                  + NOISE_AMP * ((float)rand() / RAND_MAX - 0.5f);
+    }
+}
+
+/* Naive DFT on host for verification (O(n^2), small n only) */
+static void host_dft(const float *signal, int n, acfftComplex *spectrum)
+{
+    for (int k = 0; k < n; k++) {
+        float sum_re = 0.0f, sum_im = 0.0f;
+        for (int t = 0; t < n; t++) {
+            float angle = -2.0f * PI * k * t / n;
+            sum_re += signal[t] * cosf(angle);
+            sum_im += signal[t] * sinf(angle);
+        }
+        spectrum[k].x = sum_re;
+        spectrum[k].y = sum_im;
+    }
+}
+
+/* Apply the same low-pass filter on host for verification */
+static void host_lowpass(acfftComplex *spectrum, int n, int cutoff)
+{
+    for (int i = 0; i < n; i++) {
+        if (i > cutoff && i < n - cutoff) {
+            spectrum[i].x = 0.0f;
+            spectrum[i].y = 0.0f;
+        }
+    }
+}
+
+/* Naive inverse DFT on host */
+static void host_idft(const acfftComplex *spectrum, int n, float *signal)
+{
+    for (int t = 0; t < n; t++) {
+        float sum = 0.0f;
+        for (int k = 0; k < n; k++) {
+            float angle = 2.0f * PI * k * t / n;
+            sum += spectrum[k].x * cosf(angle) - spectrum[k].y * sinf(angle);
+        }
+        signal[t] = sum / n;
+    }
+}
+
+/* Find top-K peaks in magnitude spectrum (host-side) */
+static void find_peaks(const float *mag, int n, int *peak_bins, int k)
+{
+    for (int p = 0; p < k; p++) {
+        peak_bins[p] = -1;
+        float best = 0.0f;
+        for (int i = 1; i < n / 2; i++) {
+            int skip = 0;
+            for (int j = 0; j < p; j++) {
+                if (abs(i - peak_bins[j]) < 3) { skip = 1; break; }
+            }
+            if (!skip && mag[i] > best) {
+                best = mag[i];
+                peak_bins[p] = i;
+            }
+        }
+    }
+}
+
+/* ── Main ────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[simple_acfft] Spectrum Analysis & Frequency Domain Filtering\n");
+    printf("  Signal length: %d samples\n", N_SAMPLES);
+    printf("  Signal: sin(2pi*%d*t) + 0.7*sin(2pi*%d*t) + 0.5*sin(2pi*%d*t) + noise\n\n",
+           FREQ_0, FREQ_1, FREQ_2);
+
+    findHggcDevice(argc, (const char **)argv);
+
+    int n = N_SAMPLES;
+    int bytes_c = n * sizeof(acfftComplex);
+    int bytes_f = n * sizeof(float);
+
+    /* ── Generate signal on host ── */
+    float *h_signal = (float *)malloc(bytes_f);
+    generate_signal(h_signal, n);
+
+    /* ── Copy signal to device as complex (imaginary=0) ── */
+    acfftComplex *d_data;
+    checkHggcErrors(hggcMalloc(&d_data, bytes_c));
+    {
+        acfftComplex *h_complex = (acfftComplex *)calloc(n, sizeof(acfftComplex));
+        for (int i = 0; i < n; i++)
+            h_complex[i].x = h_signal[i];
+        checkHggcErrors(hggcMemcpy(d_data, h_complex, bytes_c, hggcMemcpyHostToDevice));
+        free(h_complex);
+    }
+
+    /* ── Create ACFFT plan ── */
+    acfftHandle plan;
+    checkHggcErrors(acfftPlan1d(&plan, n, ACFFT_C2C, 1));
+
+    /* ── Forward FFT ── */
+    printf("  Forward FFT (acfftExecC2C)...\n");
+    checkHggcErrors(acfftExecC2C(plan, d_data, d_data, ACFFT_FORWARD));
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /* ── Compute magnitude spectrum on device ── */
+    float *d_mag;
+    checkHggcErrors(hggcMalloc(&d_mag, bytes_f));
+    compute_magnitude<<<(n + 255) / 256, 256>>>(d_data, d_mag, n);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /* Copy magnitude to host and find peaks */
+    float *h_mag = (float *)malloc(bytes_f);
+    checkHggcErrors(hggcMemcpy(h_mag, d_mag, bytes_f, hggcMemcpyDeviceToHost));
+
+    int peaks[3];
+    find_peaks(h_mag, n, peaks, 3);
+    printf("  Detected peak frequencies (bins): %d, %d, %d\n", peaks[0], peaks[1], peaks[2]);
+    printf("  Expected: %d, %d, %d\n\n", FREQ_0, FREQ_1, FREQ_2);
+
+    /* ── Apply low-pass filter in frequency domain ── */
+    printf("  Applying low-pass filter (cutoff = %d bins)...\n", CUTOFF);
+    apply_lowpass<<<(n + 255) / 256, 256>>>(d_data, n, CUTOFF);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /* ── Inverse FFT ── */
+    printf("  Inverse FFT (acfftExecC2C)...\n");
+    checkHggcErrors(acfftExecC2C(plan, d_data, d_data, ACFFT_INVERSE));
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /* ── Copy filtered signal to host ── */
+    acfftComplex *h_filtered = (acfftComplex *)malloc(bytes_c);
+    checkHggcErrors(hggcMemcpy(h_filtered, d_data, bytes_c, hggcMemcpyDeviceToHost));
+
+    /* ── CPU reference: DFT → lowpass → IDFT ── */
+    acfftComplex *h_ref_spectrum = (acfftComplex *)malloc(bytes_c);
+    float *h_ref_filtered = (float *)malloc(bytes_f);
+
+    host_dft(h_signal, n, h_ref_spectrum);
+    host_lowpass(h_ref_spectrum, n, CUTOFF);
+    host_idft(h_ref_spectrum, n, h_ref_filtered);
+
+    /* ── Compare ── */
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float err = fabsf(h_filtered[i].x / n - h_ref_filtered[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    /* Peak detection verification */
+    int peaks_ok = (peaks[0] == FREQ_0 && peaks[1] == FREQ_1 && peaks[2] == FREQ_2);
+    /* Filter verification: high-frequency content should be suppressed */
+    bool filter_ok = (max_err < TOL);
+
+    printf("\n  Results:\n");
+    printf("    Peak detection  : %s (found %d,%d,%d vs expected %d,%d,%d)\n",
+           peaks_ok ? "PASS" : "FAIL",
+           peaks[0], peaks[1], peaks[2], FREQ_0, FREQ_1, FREQ_2);
+    printf("    Filter verify   : %s (max error %.2e, tol %.0e)\n",
+           filter_ok ? "PASS" : "FAIL", max_err, TOL);
+    printf("    Overall         : %s\n",
+           (peaks_ok && filter_ok) ? "PASS" : "FAIL");
+
+    /* ── Cleanup ── */
+    checkHggcErrors(acfftDestroy(plan));
+    checkHggcErrors(hggcFree(d_data));
+    checkHggcErrors(hggcFree(d_mag));
+    free(h_signal); free(h_mag); free(h_filtered);
+    free(h_ref_spectrum); free(h_ref_filtered);
+
+    return (peaks_ok && filter_ok) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

@@ -1,0 +1,60 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+namespace {
+
+constexpr int kSentinelPayload = 10;
+
+static const dim3 kGrid(2, 2);
+static const dim3 kBlock(2, 2, 2);
+
+/// Linearise a 2D grid coordinate into a single block index.
+__device__ inline int linear_block_id() {
+    return blockIdx.y * gridDim.x + blockIdx.x;
+}
+
+/// Linearise a 3D thread coordinate into a single intra-block index.
+__device__ inline int linear_thread_id() {
+    return threadIdx.z * blockDim.x * blockDim.y
+         + threadIdx.y * blockDim.x
+         + threadIdx.x;
+}
+
+}  /// anonymous
+
+/// Each thread prints its own (block_id, thread_id, payload) tuple.
+__global__ void emit_thread_id(int payload) {
+    printf("[%d, %d]:\t\tValue is:%d\n",
+           linear_block_id(),
+           linear_thread_id(),
+           payload);
+}
+
+int main(int argc, char **argv) {
+    int devID = findHggcDevice(argc, (const char **)argv);
+
+    hggcDeviceProp props;
+    checkHggcErrors(hggcGetDevice(&devID));
+    checkHggcErrors(hggcGetDeviceProperties(&props, devID));
+    std::printf("Device %d: \"%s\"\n", devID, props.name);
+
+    std::printf("printf() is called. Output:\n\n");
+
+    emit_thread_id<<<kGrid, kBlock>>>(kSentinelPayload);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    return EXIT_SUCCESS;
+}

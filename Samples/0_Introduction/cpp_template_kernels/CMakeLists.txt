@@ -1,0 +1,2 @@
+add_executable(cpp_template_kernels cpp_template_kernels.hg)
+target_include_directories(cpp_template_kernels PRIVATE ${COMMON_DIR})

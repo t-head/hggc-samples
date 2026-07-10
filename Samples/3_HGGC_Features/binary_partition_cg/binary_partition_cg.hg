@@ -1,0 +1,198 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * binary_partition_cg -- Warp-Level Conditional Routing via Binary Partition
+ *
+ * Demonstrates cg::binary_partition() for dynamic warp sub-grouping:
+ *
+ * Use case: Given an array of float values, partition each warp into
+ * "positive" and "negative" sub-groups at runtime, then:
+ *   - Positive group: compute group-local max
+ *   - Negative group: compute group-local min (most negative)
+ *
+ * This pattern is useful in:
+ *   - ML inference: conditional routing (MoE gating)
+ *   - Physics simulation: particle classification
+ *   - Graph algorithms: frontier expansion with heterogeneous neighbors
+ */
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace cg = cooperative_groups;
+
+namespace {
+constexpr int N = 32768;
+constexpr int BLOCK = 256;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: partition warp into pos/neg groups, reduce each independently
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void conditional_route_kernel(
+    const float * __restrict__ data,
+    float       * __restrict__ pos_max_per_warp,  // max of positive values per warp
+    float       * __restrict__ neg_min_per_warp,  // min of negative values per warp
+    int         * __restrict__ pos_count_per_warp,
+    int         * __restrict__ neg_count_per_warp,
+    int n)
+{
+    cg::thread_block cta = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(cta);
+
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = gid / 32;
+
+    if (gid >= n) return;
+
+    float val = data[gid];
+    bool is_positive = (val >= 0.0f);
+
+    // Dynamic binary partition: split warp into pos/neg sub-groups
+    auto sub_group = cg::binary_partition(warp, is_positive);
+
+    if (is_positive) {
+        // Positive sub-group: find the maximum
+        float local_max = cg::reduce(sub_group, val, cg::greater<float>());
+        if (sub_group.thread_rank() == 0) {
+            atomicMax(reinterpret_cast<int *>(&pos_max_per_warp[warp_id]),
+                      __float_as_int(local_max));
+            atomicAdd(&pos_count_per_warp[warp_id], (int)sub_group.size());
+        }
+    } else {
+        // Negative sub-group: find the minimum (most negative)
+        float local_min = cg::reduce(sub_group, val, cg::less<float>());
+        if (sub_group.thread_rank() == 0) {
+            atomicMin(reinterpret_cast<int *>(&neg_min_per_warp[warp_id]),
+                      __float_as_int(local_min));
+            atomicAdd(&neg_count_per_warp[warp_id], (int)sub_group.size());
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[binary_partition_cg] Conditional Routing via Binary Partition\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    const int num_warps = N / 32;
+
+    // Generate input: mix of positive and negative floats.
+    float *h_data = (float *)malloc(N * sizeof(float));
+    srand(42);
+    for (int i = 0; i < N; ++i) {
+        h_data[i] = ((float)(rand() % 2000) - 1000.0f) * 0.01f;  // [-10, +10]
+    }
+
+    // CPU reference: compute per-warp pos_max, neg_min, counts.
+    float *ref_pos_max = (float *)malloc(num_warps * sizeof(float));
+    float *ref_neg_min = (float *)malloc(num_warps * sizeof(float));
+    int   *ref_pos_cnt = (int *)calloc(num_warps, sizeof(int));
+    int   *ref_neg_cnt = (int *)calloc(num_warps, sizeof(int));
+
+    for (int w = 0; w < num_warps; ++w) {
+        ref_pos_max[w] = -FLT_MAX;
+        ref_neg_min[w] = FLT_MAX;
+        for (int l = 0; l < 32; ++l) {
+            float v = h_data[w * 32 + l];
+            if (v >= 0.0f) {
+                ref_pos_max[w] = fmaxf(ref_pos_max[w], v);
+                ref_pos_cnt[w]++;
+            } else {
+                ref_neg_min[w] = fminf(ref_neg_min[w], v);
+                ref_neg_cnt[w]++;
+            }
+        }
+    }
+
+    // Device buffers.
+    float *d_data, *d_pos_max, *d_neg_min;
+    int   *d_pos_cnt, *d_neg_cnt;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_pos_max), num_warps * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_neg_min), num_warps * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_pos_cnt), num_warps * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_neg_cnt), num_warps * sizeof(int)));
+
+    checkHggcErrors(hggcMemcpy(d_data, h_data, N * sizeof(float), hggcMemcpyHostToDevice));
+
+    // Initialize pos_max to -FLT_MAX, neg_min to +FLT_MAX (as int bit patterns).
+    {
+        float init_max = -FLT_MAX;
+        float init_min = FLT_MAX;
+        // Fill using a temp host array then copy (simple approach for demo).
+        float *h_init_max = (float *)malloc(num_warps * sizeof(float));
+        float *h_init_min = (float *)malloc(num_warps * sizeof(float));
+        for (int i = 0; i < num_warps; ++i) { h_init_max[i] = init_max; h_init_min[i] = init_min; }
+        checkHggcErrors(hggcMemcpy(d_pos_max, h_init_max, num_warps * sizeof(float), hggcMemcpyHostToDevice));
+        checkHggcErrors(hggcMemcpy(d_neg_min, h_init_min, num_warps * sizeof(float), hggcMemcpyHostToDevice));
+        free(h_init_max); free(h_init_min);
+    }
+    checkHggcErrors(hggcMemset(d_pos_cnt, 0, num_warps * sizeof(int)));
+    checkHggcErrors(hggcMemset(d_neg_cnt, 0, num_warps * sizeof(int)));
+
+    // Launch.
+    dim3 grid((N + BLOCK - 1) / BLOCK);
+    dim3 block(BLOCK);
+    conditional_route_kernel<<<grid, block>>>(
+        d_data, d_pos_max, d_neg_min, d_pos_cnt, d_neg_cnt, N);
+    getLastHggcError("conditional_route_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    // Read back and validate.
+    float *h_pos_max = (float *)malloc(num_warps * sizeof(float));
+    float *h_neg_min = (float *)malloc(num_warps * sizeof(float));
+    int   *h_pos_cnt = (int *)malloc(num_warps * sizeof(int));
+    int   *h_neg_cnt = (int *)malloc(num_warps * sizeof(int));
+    checkHggcErrors(hggcMemcpy(h_pos_max, d_pos_max, num_warps * sizeof(float), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_neg_min, d_neg_min, num_warps * sizeof(float), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_pos_cnt, d_pos_cnt, num_warps * sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_neg_cnt, d_neg_cnt, num_warps * sizeof(int), hggcMemcpyDeviceToHost));
+
+    bool pass = true;
+    for (int w = 0; w < num_warps && pass; ++w) {
+        if (ref_pos_cnt[w] > 0 && h_pos_max[w] != ref_pos_max[w]) pass = false;
+        if (ref_neg_cnt[w] > 0 && h_neg_min[w] != ref_neg_min[w]) pass = false;
+        if (h_pos_cnt[w] != ref_pos_cnt[w]) pass = false;
+        if (h_neg_cnt[w] != ref_neg_cnt[w]) pass = false;
+    }
+
+    // Print a few sample warps.
+    printf("  Sample results (first 4 warps):\n");
+    for (int w = 0; w < 4; ++w) {
+        printf("    Warp %d: pos(%d, max=%.2f)  neg(%d, min=%.2f)\n",
+               w, h_pos_cnt[w], h_pos_max[w], h_neg_cnt[w], h_neg_min[w]);
+    }
+
+    // Cleanup.
+    free(h_data); free(ref_pos_max); free(ref_neg_min);
+    free(ref_pos_cnt); free(ref_neg_cnt);
+    free(h_pos_max); free(h_neg_min); free(h_pos_cnt); free(h_neg_cnt);
+    checkHggcErrors(hggcFree(d_data));
+    checkHggcErrors(hggcFree(d_pos_max));
+    checkHggcErrors(hggcFree(d_neg_min));
+    checkHggcErrors(hggcFree(d_pos_cnt));
+    checkHggcErrors(hggcFree(d_neg_cnt));
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

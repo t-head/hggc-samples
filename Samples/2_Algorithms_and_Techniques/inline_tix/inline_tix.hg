@@ -1,0 +1,244 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * inline_tix — TIX Instruction Showcase (Runtime API)
+ *
+ * Demonstrates four categories of TIX inline assembly beyond trivial
+ * register reads, each with a practical use case:
+ *   1. FMA (ppu.fma.rtte.f32)     — Horner's method polynomial evaluation
+ *   2. Popcount (ppu.popc.b32)    — Hamming weight / set-bit counting
+ *   3. Wide multiply (ppu.mul.wide.s32) — 64-bit product from 32-bit inputs
+ *   4. Bit-field extract (ppu.bfe.u32)  — Extract arbitrary bit slices
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int N = 1024;
+constexpr int BLOCK = 256;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 1: FMA — Horner's polynomial p(x) = 3x³ + 2x² + x + 0.5
+// Uses ppu.fma.rtte.f32 for single-rounding fused multiply-add.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void horner_fma_kernel(float *out, const float *x_arr, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float x = x_arr[idx];
+    float result;
+
+    // Horner: ((3*x + 2)*x + 1)*x + 0.5
+    // Step 1: acc = 3*x + 2
+    asm("ppu.fma.rtte.f32 %0, %1, %2, %3;"
+        : "=f"(result)
+        : "f"(3.0f), "f"(x), "f"(2.0f));
+    // Step 2: acc = acc*x + 1
+    asm("ppu.fma.rtte.f32 %0, %1, %2, %3;"
+        : "=f"(result)
+        : "f"(result), "f"(x), "f"(1.0f));
+    // Step 3: acc = acc*x + 0.5
+    asm("ppu.fma.rtte.f32 %0, %1, %2, %3;"
+        : "=f"(result)
+        : "f"(result), "f"(x), "f"(0.5f));
+
+    out[idx] = result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 2: Popcount — count set bits (Hamming weight)
+// Uses ppu.popc.b32 to count the number of 1-bits in a word.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void popc_kernel(int *out, const unsigned int *data, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int val = data[idx];
+    int count;
+    asm("ppu.popc.b32 %0, %1;" : "=r"(count) : "r"(val));
+    out[idx] = count;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 3: Wide multiply — 32×32 → 64-bit product
+// Uses ppu.mul.wide.s32 to get a full 64-bit result from two int32.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void wide_mul_kernel(long long *out, const int *a, const int *b, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    int va = a[idx];
+    int vb = b[idx];
+    long long product;
+    asm("ppu.mul.wide.s32 %0, %1, %2;" : "=l"(product) : "r"(va), "r"(vb));
+    out[idx] = product;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 4: Bit-field extract — extract bits [pos, pos+len)
+// Uses ppu.bfe.u32 to pull an arbitrary bit slice from a word.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void bfe_kernel(unsigned int *out, const unsigned int *data,
+                          int pos, int len, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int val = data[idx];
+    unsigned int extracted;
+    // ppu.bfe.u32 d, a, pos, len  — extracts bits [pos, pos+len) from a
+    asm("ppu.bfe.u32 %0, %1, %2, %3;"
+        : "=r"(extracted)
+        : "r"(val), "r"(pos), "r"(len));
+    out[idx] = extracted;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[inline_tix] TIX Instruction Showcase\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    dim3 block(BLOCK);
+    dim3 grid((N + BLOCK - 1) / BLOCK);
+    bool all_pass = true;
+
+    // ---- Test 1: FMA Horner ----
+    printf("  Test 1: ppu.fma.rtte.f32 (Horner polynomial)\n");
+    {
+        float *h_x   = (float *)malloc(N * sizeof(float));
+        float *h_out = (float *)malloc(N * sizeof(float));
+        for (int i = 0; i < N; ++i) h_x[i] = (i - N / 2) * 0.01f;
+
+        float *d_x, *d_out;
+        checkHggcErrors(hggcMalloc((void **)&d_x, N * sizeof(float)));
+        checkHggcErrors(hggcMalloc((void **)&d_out, N * sizeof(float)));
+        checkHggcErrors(hggcMemcpy(d_x, h_x, N * sizeof(float), hggcMemcpyHostToDevice));
+
+        horner_fma_kernel<<<grid, block>>>(d_out, d_x, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+        checkHggcErrors(hggcMemcpy(h_out, d_out, N * sizeof(float), hggcMemcpyDeviceToHost));
+
+        bool pass = true;
+        for (int i = 0; i < N && pass; ++i) {
+            float x = h_x[i];
+            // Use fmaf() to match PPU's FMA single-rounding semantics
+            float ref = fmaf(fmaf(fmaf(3.0f, x, 2.0f), x, 1.0f), x, 0.5f);
+            if (fabsf(h_out[i] - ref) > 1e-5f) pass = false;
+        }
+        printf("    %s\n", pass ? "PASS" : "FAIL");
+        all_pass = all_pass && pass;
+
+        hggcFree(d_x); hggcFree(d_out); free(h_x); free(h_out);
+    }
+
+    // ---- Test 2: Popcount ----
+    printf("  Test 2: ppu.popc.b32 (population count)\n");
+    {
+        unsigned int *h_data = (unsigned int *)malloc(N * sizeof(unsigned int));
+        int *h_out = (int *)malloc(N * sizeof(int));
+        for (int i = 0; i < N; ++i) h_data[i] = (unsigned int)(i * 0x9e3779b9u);
+
+        unsigned int *d_data; int *d_out;
+        checkHggcErrors(hggcMalloc((void **)&d_data, N * sizeof(unsigned int)));
+        checkHggcErrors(hggcMalloc((void **)&d_out, N * sizeof(int)));
+        checkHggcErrors(hggcMemcpy(d_data, h_data, N * sizeof(unsigned int), hggcMemcpyHostToDevice));
+
+        popc_kernel<<<grid, block>>>(d_out, d_data, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+        checkHggcErrors(hggcMemcpy(h_out, d_out, N * sizeof(int), hggcMemcpyDeviceToHost));
+
+        bool pass = true;
+        for (int i = 0; i < N && pass; ++i) {
+            if (h_out[i] != __builtin_popcount(h_data[i])) pass = false;
+        }
+        printf("    %s\n", pass ? "PASS" : "FAIL");
+        all_pass = all_pass && pass;
+
+        hggcFree(d_data); hggcFree(d_out); free(h_data); free(h_out);
+    }
+
+    // ---- Test 3: Wide multiply ----
+    printf("  Test 3: ppu.mul.wide.s32 (32x32 -> 64-bit product)\n");
+    {
+        int *h_a = (int *)malloc(N * sizeof(int));
+        int *h_b = (int *)malloc(N * sizeof(int));
+        long long *h_out = (long long *)malloc(N * sizeof(long long));
+        for (int i = 0; i < N; ++i) { h_a[i] = i - 512; h_b[i] = i * 3 + 7; }
+
+        int *d_a, *d_b; long long *d_out;
+        checkHggcErrors(hggcMalloc((void **)&d_a, N * sizeof(int)));
+        checkHggcErrors(hggcMalloc((void **)&d_b, N * sizeof(int)));
+        checkHggcErrors(hggcMalloc((void **)&d_out, N * sizeof(long long)));
+        checkHggcErrors(hggcMemcpy(d_a, h_a, N * sizeof(int), hggcMemcpyHostToDevice));
+        checkHggcErrors(hggcMemcpy(d_b, h_b, N * sizeof(int), hggcMemcpyHostToDevice));
+
+        wide_mul_kernel<<<grid, block>>>(d_out, d_a, d_b, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+        checkHggcErrors(hggcMemcpy(h_out, d_out, N * sizeof(long long), hggcMemcpyDeviceToHost));
+
+        bool pass = true;
+        for (int i = 0; i < N && pass; ++i) {
+            if (h_out[i] != (long long)h_a[i] * (long long)h_b[i]) pass = false;
+        }
+        printf("    %s\n", pass ? "PASS" : "FAIL");
+        all_pass = all_pass && pass;
+
+        hggcFree(d_a); hggcFree(d_b); hggcFree(d_out);
+        free(h_a); free(h_b); free(h_out);
+    }
+
+    // ---- Test 4: Bit-field extract ----
+    printf("  Test 4: ppu.bfe.u32 (bit-field extract)\n");
+    {
+        const int POS = 8, LEN = 8;  // extract bits [8..15] (second byte)
+        unsigned int *h_data = (unsigned int *)malloc(N * sizeof(unsigned int));
+        unsigned int *h_out  = (unsigned int *)malloc(N * sizeof(unsigned int));
+        for (int i = 0; i < N; ++i) h_data[i] = 0xDEAD0000u | (unsigned int)i;
+
+        unsigned int *d_data, *d_out;
+        checkHggcErrors(hggcMalloc((void **)&d_data, N * sizeof(unsigned int)));
+        checkHggcErrors(hggcMalloc((void **)&d_out, N * sizeof(unsigned int)));
+        checkHggcErrors(hggcMemcpy(d_data, h_data, N * sizeof(unsigned int), hggcMemcpyHostToDevice));
+
+        bfe_kernel<<<grid, block>>>(d_out, d_data, POS, LEN, N);
+        checkHggcErrors(hggcDeviceSynchronize());
+        checkHggcErrors(hggcMemcpy(h_out, d_out, N * sizeof(unsigned int), hggcMemcpyDeviceToHost));
+
+        bool pass = true;
+        for (int i = 0; i < N && pass; ++i) {
+            unsigned int ref = (h_data[i] >> POS) & ((1u << LEN) - 1u);
+            if (h_out[i] != ref) pass = false;
+        }
+        printf("    %s\n", pass ? "PASS" : "FAIL");
+        all_pass = all_pass && pass;
+
+        hggcFree(d_data); hggcFree(d_out); free(h_data); free(h_out);
+    }
+
+    printf("\n  Result: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

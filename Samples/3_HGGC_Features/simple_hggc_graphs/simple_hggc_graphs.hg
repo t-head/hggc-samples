@@ -1,0 +1,261 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * simple_hggc_graphs -- Graph Node Types Showcase
+ *
+ * Demonstrates the full variety of HGGC Graph node types in one cohesive
+ * pipeline:
+ *
+ *   1. Kernel node       -- compute step
+ *   2. Event Record node -- mark completion point within graph
+ *   3. Event Wait node   -- synchronize with event from another graph
+ *   4. Host Callback node-- invoke host function from graph
+ *   5. Child Graph node  -- embed a sub-graph as a single node
+ *   6. Graph Clone       -- duplicate a graph for variant execution
+ *
+ * Scenario: Two-stage pipeline (preprocess -> postprocess) where:
+ *   - Stage 1 graph: memset + kernel(scale) + event_record
+ *   - Stage 2 graph: event_wait + kernel(bias) + host_callback(verify)
+ *   - Child graph demo: embed stage 1 as child node in a parent graph
+ *   - Clone demo: clone stage 2 and modify one node
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int N = 1024;
+constexpr int BLOCK = 256;
+constexpr int GRID = (N + BLOCK - 1) / BLOCK;
+
+// Host callback data
+struct VerifyData {
+    float *d_result;
+    float  expected_first;
+    int    n;
+};
+}  // namespace
+
+// ---- Kernels ----
+
+__global__ void scale_kernel(float *data, float factor, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] *= factor;
+}
+
+__global__ void bias_kernel(float *data, float bias, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] += bias;
+}
+
+// ---- Host callback function ----
+void HGGCRT_CB verify_callback(void *userData)
+{
+    printf("    [Host Callback] Verification triggered from graph!\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[simple_hggc_graphs] Graph Node Types Showcase\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    size_t bytes = N * sizeof(float);
+    float *d_data;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data), bytes));
+
+    // Initialize: fill with 1.0
+    float *h_init = (float *)malloc(bytes);
+    for (int i = 0; i < N; ++i) h_init[i] = 1.0f;
+    checkHggcErrors(hggcMemcpy(d_data, h_init, bytes, hggcMemcpyHostToDevice));
+
+    hggcEvent_t sync_event;
+    checkHggcErrors(hggcEventCreate(&sync_event));
+
+    // ════════════════════════════════════════════════════════════════════
+    // Demo 1: Event Record/Wait nodes for inter-graph synchronization
+    // ════════════════════════════════════════════════════════════════════
+    printf("  Demo 1: Event Record/Wait nodes\n");
+
+    // Stage 1 graph: scale(x2) + event_record
+    hggcGraph_t graph1;
+    checkHggcErrors(hggcGraphCreate(&graph1, 0));
+    {
+        hggcGraphNode_t scaleNode, eventNode;
+
+        // Kernel node: scale by 2
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)scale_kernel;
+        kp.gridDim = dim3(GRID);
+        kp.blockDim = dim3(BLOCK);
+        float factor = 2.0f;
+        int n = N;
+        void *args[] = {&d_data, &factor, &n};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&scaleNode, graph1, NULL, 0, &kp));
+
+        // Event Record node: record after scale completes
+        checkHggcErrors(hggcGraphAddEventRecordNode(&eventNode, graph1, &scaleNode, 1, sync_event));
+    }
+
+    // Stage 2 graph: event_wait + bias(+1) + host_callback
+    hggcGraph_t graph2;
+    checkHggcErrors(hggcGraphCreate(&graph2, 0));
+    {
+        hggcGraphNode_t waitNode, biasNode, hostNode;
+
+        // Event Wait node: wait for stage 1's event
+        checkHggcErrors(hggcGraphAddEventWaitNode(&waitNode, graph2, NULL, 0, sync_event));
+
+        // Kernel node: bias +1
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)bias_kernel;
+        kp.gridDim = dim3(GRID);
+        kp.blockDim = dim3(BLOCK);
+        float bias = 1.0f;
+        int n = N;
+        void *args[] = {&d_data, &bias, &n};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&biasNode, graph2, &waitNode, 1, &kp));
+
+        // Host Callback node: print verification message
+        hggcHostNodeParams hp = {};
+        hp.fn = verify_callback;
+        hp.userData = nullptr;
+        checkHggcErrors(hggcGraphAddHostNode(&hostNode, graph2, &biasNode, 1, &hp));
+    }
+
+    // Instantiate and launch both graphs on same stream
+    hggcGraphExec_t exec1, exec2;
+    checkHggcErrors(hggcGraphInstantiate(&exec1, graph1, NULL, NULL, 0));
+    checkHggcErrors(hggcGraphInstantiate(&exec2, graph2, NULL, NULL, 0));
+
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+    checkHggcErrors(hggcGraphLaunch(exec1, stream));  // scale x2
+    checkHggcErrors(hggcGraphLaunch(exec2, stream));  // wait + bias +1
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    // Verify: 1.0 * 2 + 1 = 3.0
+    float h_val;
+    checkHggcErrors(hggcMemcpy(&h_val, d_data, sizeof(float), hggcMemcpyDeviceToHost));
+    printf("    Result: d_data[0] = %.1f (expected 3.0) %s\n\n",
+           h_val, (fabsf(h_val - 3.0f) < 0.01f) ? "PASS" : "FAIL");
+
+    // ════════════════════════════════════════════════════════════════════
+    // Demo 2: Child Graph node (embed graph1 as sub-node)
+    // ════════════════════════════════════════════════════════════════════
+    printf("  Demo 2: Child Graph node\n");
+
+    // Reset data to 1.0
+    checkHggcErrors(hggcMemcpy(d_data, h_init, bytes, hggcMemcpyHostToDevice));
+
+    hggcGraph_t parentGraph;
+    checkHggcErrors(hggcGraphCreate(&parentGraph, 0));
+    {
+        hggcGraphNode_t childNode, biasNode;
+
+        // Child graph node: embeds graph1 (scale x2) as a single node
+        checkHggcErrors(hggcGraphAddChildGraphNode(&childNode, parentGraph, NULL, 0, graph1));
+
+        // Follow with bias +5
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)bias_kernel;
+        kp.gridDim = dim3(GRID);
+        kp.blockDim = dim3(BLOCK);
+        float bias = 5.0f;
+        int n = N;
+        void *args[] = {&d_data, &bias, &n};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&biasNode, parentGraph, &childNode, 1, &kp));
+    }
+
+    hggcGraphExec_t execParent;
+    checkHggcErrors(hggcGraphInstantiate(&execParent, parentGraph, NULL, NULL, 0));
+    checkHggcErrors(hggcGraphLaunch(execParent, stream));
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    checkHggcErrors(hggcMemcpy(&h_val, d_data, sizeof(float), hggcMemcpyDeviceToHost));
+    printf("    Result: d_data[0] = %.1f (expected 7.0: 1*2 + 5) %s\n\n",
+           h_val, (fabsf(h_val - 7.0f) < 0.01f) ? "PASS" : "FAIL");
+
+    // ════════════════════════════════════════════════════════════════════
+    // Demo 3: Graph Clone (duplicate and modify)
+    // ════════════════════════════════════════════════════════════════════
+    printf("  Demo 3: Graph Clone + Modify\n");
+
+    hggcGraph_t graph2_clone;
+    checkHggcErrors(hggcGraphClone(&graph2_clone, graph2));
+
+    // Query nodes in cloned graph
+    size_t numNodes = 0;
+    checkHggcErrors(hggcGraphGetNodes(graph2_clone, NULL, &numNodes));
+    hggcGraphNode_t *clonedNodes = (hggcGraphNode_t *)malloc(numNodes * sizeof(hggcGraphNode_t));
+    checkHggcErrors(hggcGraphGetNodes(graph2_clone, clonedNodes, &numNodes));
+    printf("    Cloned graph has %zu nodes\n", numNodes);
+
+    // Modify the bias kernel node in clone: change bias from +1 to +10
+    // Node order: [0]=eventWait, [1]=biasKernel, [2]=hostCallback
+    {
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)bias_kernel;
+        kp.gridDim = dim3(GRID);
+        kp.blockDim = dim3(BLOCK);
+        float new_bias = 10.0f;  // changed from 1.0 to 10.0
+        int n = N;
+        void *args[] = {&d_data, &new_bias, &n};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphKernelNodeSetParams(clonedNodes[1], &kp));
+    }
+    printf("    Modified clone: bias changed from +1 to +10\n");
+
+    // Instantiate and run: scale(graph1) + modified clone (bias +10)
+    hggcGraphExec_t execClone;
+    checkHggcErrors(hggcGraphInstantiate(&execClone, graph2_clone, NULL, NULL, 0));
+
+    checkHggcErrors(hggcMemcpy(d_data, h_init, bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcGraphLaunch(exec1, stream));     // scale x2: 1*2 = 2
+    checkHggcErrors(hggcGraphLaunch(execClone, stream)); // bias +10: 2+10 = 12
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    checkHggcErrors(hggcMemcpy(&h_val, d_data, sizeof(float), hggcMemcpyDeviceToHost));
+    printf("    Result: d_data[0] = %.1f (expected 12.0: 1*2 + 10) %s\n\n",
+           h_val, (fabsf(h_val - 12.0f) < 0.01f) ? "PASS" : "FAIL");
+
+    free(clonedNodes);
+
+    // ════════════════════════════════════════════════════════════════════
+    // Cleanup
+    // ════════════════════════════════════════════════════════════════════
+    checkHggcErrors(hggcGraphExecDestroy(exec1));
+    checkHggcErrors(hggcGraphExecDestroy(exec2));
+    checkHggcErrors(hggcGraphExecDestroy(execParent));
+    checkHggcErrors(hggcGraphExecDestroy(execClone));
+    checkHggcErrors(hggcGraphDestroy(graph1));
+    checkHggcErrors(hggcGraphDestroy(graph2));
+    checkHggcErrors(hggcGraphDestroy(graph2_clone));
+    checkHggcErrors(hggcGraphDestroy(parentGraph));
+    checkHggcErrors(hggcEventDestroy(sync_event));
+    checkHggcErrors(hggcStreamDestroy(stream));
+    checkHggcErrors(hggcFree(d_data));
+    free(h_init);
+
+    printf("  Result: PASS\n");
+    return EXIT_SUCCESS;
+}

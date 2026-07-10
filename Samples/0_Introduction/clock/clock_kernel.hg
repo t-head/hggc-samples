@@ -1,0 +1,77 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * clock_kernel.hg — Device-side clock() microbenchmark kernels
+ *
+ * Two kernels that accumulate values from global memory with different
+ * access patterns, recording clock() at entry and exit of each block.
+ * Comparing the two reveals the throughput impact of memory coalescing.
+ */
+
+/// Coalesced read: consecutive threads read consecutive addresses.
+/// This is the optimal pattern for memory bandwidth utilization.
+extern "C" __global__ void clock_coalesced(
+    const float * __restrict__ input,
+    float       * __restrict__ output,
+    clock_t     *timer,
+    int           num_iters)
+{
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int gid = bid * blockDim.x + tid;
+    const int stride = gridDim.x * blockDim.x;  // total thread count
+
+    if (tid == 0) timer[bid] = clock();
+    __syncthreads();
+
+    // Each thread accumulates elements in a coalesced (stride = total threads)
+    // pattern: thread i reads input[i], input[i + stride], input[i + 2*stride] ...
+    float acc = 0.0f;
+    int idx = gid;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        acc += input[idx % (gridDim.x * blockDim.x)];
+        idx += stride;
+    }
+
+    output[gid] = acc;
+    __syncthreads();
+
+    if (tid == 0) timer[bid + gridDim.x] = clock();
+}
+
+/// Strided read: each thread jumps by a large stride between accesses.
+/// This causes uncoalesced transactions and significantly higher latency.
+extern "C" __global__ void clock_strided(
+    const float * __restrict__ input,
+    float       * __restrict__ output,
+    clock_t     *timer,
+    int           num_iters)
+{
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int gid = bid * blockDim.x + tid;
+    const int total = gridDim.x * blockDim.x;
+
+    if (tid == 0) timer[bid] = clock();
+    __syncthreads();
+
+    // Each thread reads with a stride of blockDim.x within its own block-sized
+    // chunk — neighboring threads hit addresses far apart, destroying coalescing.
+    float acc = 0.0f;
+    const int base = bid * blockDim.x;
+    for (int iter = 0; iter < num_iters; ++iter) {
+        int off = (tid * 32 + iter) % (int)blockDim.x;  // pseudo-random stride
+        acc += input[base + off];
+    }
+
+    output[gid] = acc;
+    __syncthreads();
+
+    if (tid == 0) timer[bid + gridDim.x] = clock();
+}

@@ -1,0 +1,230 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * graph_conditional_nodes -- Iterative Solver with Graph Conditional While
+ *
+ * Demonstrates HGGC Graph conditional nodes with a practical use case:
+ * Jacobi-style iterative refinement that loops until convergence, with
+ * the termination decision made entirely on-device.
+ *
+ * Graph structure:
+ *   init_kernel -> WHILE [ jacobi_step -> check_convergence ] -> done_kernel
+ *
+ * The conditional while node loops as long as the residual norm exceeds
+ * a tolerance.  check_convergence sets the conditional handle to 0 when
+ * converged, causing the graph to exit the loop.
+ *
+ * This shows:
+ *   - hggcGraphConditionalHandleCreate
+ *   - hggcGraphAddNode with hggcGraphNodeTypeConditional
+ *   - hggcGraphSetConditional from device code
+ *   - Stream capture to populate conditional body
+ *   - Device-side convergence decision controlling graph flow
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <hggc.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int N = 64;          // Small system for demo
+constexpr float TOL = 1e-4f;   // Convergence tolerance
+constexpr int MAX_ITER = 1000; // Safety cap
+}  // namespace
+
+// ---- Device kernels ----
+
+/// Initialize x to zero, set iteration counter to 0.
+__global__ void init_kernel(float *x, int *iter_count, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) x[idx] = 0.0f;
+    if (idx == 0) *iter_count = 0;
+}
+
+/// One Jacobi iteration: x_new[i] = (b[i] - sum_{j!=i} A[i][j]*x[j]) / A[i][i]
+/// For demo we use a simple diagonally-dominant system where A[i][i]=4, A[i][i+/-1]=-1.
+__global__ void jacobi_step_kernel(
+    const float *x_old, float *x_new, const float *b, int n, int *iter_count)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // Tridiagonal: A[i][i]=4, A[i][i-1]=-1, A[i][i+1]=-1
+    float sum = b[i];
+    if (i > 0)   sum += x_old[i - 1];   // -(-1)*x[i-1]
+    if (i < n-1) sum += x_old[i + 1];   // -(-1)*x[i+1]
+    x_new[i] = sum / 4.0f;
+
+    if (i == 0) (*iter_count)++;
+}
+
+/// Check convergence: compute max|x_new - x_old|, set conditional handle.
+__global__ void check_convergence_kernel(
+    const float *x_new, float *x_old, int n,
+    float tol, hggcGraphConditionalHandle handle)
+{
+    // Simple: thread 0 does serial check (fine for small N demo)
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float diff = fabsf(x_new[i] - x_old[i]);
+        if (diff > max_diff) max_diff = diff;
+        // Copy x_new -> x_old for next iteration
+        x_old[i] = x_new[i];
+    }
+
+    // Continue looping if not converged
+    unsigned int keep_going = (max_diff > tol) ? 1 : 0;
+    hggcGraphSetConditional(handle, keep_going);
+}
+
+/// Final kernel: just marks completion.
+__global__ void done_kernel(int *iter_count)
+{
+    if (threadIdx.x == 0)
+        printf("  PPU: Converged in %d iterations\n", *iter_count);
+}
+
+// ---- Host ----
+
+int main(int argc, char **argv)
+{
+    printf("[graph_conditional_nodes] Iterative Solver with Conditional While\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    // Setup RHS vector b (for tridiagonal system with solution x=1)
+    // With A[i][i]=4, A[i][i+/-1]=-1, solution x[i]=1 gives:
+    //   b[0] = 4*1 - 1*1 = 3,  b[middle] = 4 - 1 - 1 = 2,  b[N-1] = 4 - 1 = 3
+    float h_b[N];
+    for (int i = 0; i < N; ++i) {
+        h_b[i] = 4.0f;
+        if (i > 0)   h_b[i] -= 1.0f;
+        if (i < N-1) h_b[i] -= 1.0f;
+    }
+
+    // Device allocations
+    float *d_x_old, *d_x_new, *d_b;
+    int   *d_iter;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_x_old), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_x_new), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_b), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_iter), sizeof(int)));
+    checkHggcErrors(hggcMemcpy(d_b, h_b, N * sizeof(float), hggcMemcpyHostToDevice));
+
+    // ---- Build Graph ----
+    hggcGraph_t graph;
+    hggcGraphExec_t graphExec;
+    checkHggcErrors(hggcGraphCreate(&graph, 0));
+
+    // Create conditional handle (default=1 so body executes at least once = do-while)
+    hggcGraphConditionalHandle handle;
+    checkHggcErrors(hggcGraphConditionalHandleCreate(&handle, graph, 1, hggcGraphCondAssignDefault));
+
+    // Node 1: init_kernel
+    hggcGraphNode_t initNode;
+    {
+        hggcGraphNodeParams params = {hggcGraphNodeTypeKernel};
+        params.kernel.func = (void *)init_kernel;
+        params.kernel.gridDim = {(N + 255) / 256, 1, 1};
+        params.kernel.blockDim = {256, 1, 1};
+        void *args[] = {&d_x_old, &d_iter, (void *)&N};
+        params.kernel.kernelParams = args;
+#if HGGC_VERSION >= 13000
+        checkHggcErrors(hggcGraphAddNode(&initNode, graph, NULL, NULL, 0, &params));
+#else
+        checkHggcErrors(hggcGraphAddNode(&initNode, graph, NULL, 0, &params));
+#endif
+    }
+
+    // Node 2: Conditional WHILE
+    hggcGraphNode_t condNode;
+    hggcGraph_t bodyGraph;
+    {
+        hggcGraphNodeParams cParams = {hggcGraphNodeTypeConditional};
+        cParams.conditional.handle = handle;
+        cParams.conditional.type = hggcGraphCondTypeWhile;
+        cParams.conditional.size = 1;
+#if HGGC_VERSION >= 13000
+        checkHggcErrors(hggcGraphAddNode(&condNode, graph, &initNode, NULL, 1, &cParams));
+#else
+        checkHggcErrors(hggcGraphAddNode(&condNode, graph, &initNode, 1, &cParams));
+#endif
+        bodyGraph = cParams.conditional.phGraph_out[0];
+    }
+
+    // Populate conditional body via stream capture
+    {
+        hggcStream_t captureStream;
+        checkHggcErrors(hggcStreamCreate(&captureStream));
+        checkHggcErrors(hggcStreamBeginCaptureToGraph(
+            captureStream, bodyGraph, nullptr, nullptr, 0, hggcStreamCaptureModeGlobal));
+
+        int n = N;
+        float tol = TOL;
+        jacobi_step_kernel<<<1, 256, 0, captureStream>>>(d_x_old, d_x_new, d_b, n, d_iter);
+        check_convergence_kernel<<<1, 1, 0, captureStream>>>(d_x_new, d_x_old, n, tol, handle);
+
+        checkHggcErrors(hggcStreamEndCapture(captureStream, nullptr));
+        checkHggcErrors(hggcStreamDestroy(captureStream));
+    }
+
+    // Node 3: done_kernel (after loop)
+    hggcGraphNode_t doneNode;
+    {
+        hggcGraphNodeParams params = {hggcGraphNodeTypeKernel};
+        params.kernel.func = (void *)done_kernel;
+        params.kernel.gridDim = {1, 1, 1};
+        params.kernel.blockDim = {1, 1, 1};
+        void *args[] = {&d_iter};
+        params.kernel.kernelParams = args;
+#if HGGC_VERSION >= 13000
+        checkHggcErrors(hggcGraphAddNode(&doneNode, graph, &condNode, NULL, 1, &params));
+#else
+        checkHggcErrors(hggcGraphAddNode(&doneNode, graph, &condNode, 1, &params));
+#endif
+    }
+
+    // Instantiate and launch
+    checkHggcErrors(hggcGraphInstantiate(&graphExec, graph, NULL, NULL, 0));
+
+    printf("  Solving %dx%d tridiagonal system (Jacobi, tol=%e)\n", N, N, TOL);
+    printf("  Expected solution: x[i] = 1.0 for all i\n\n");
+
+    checkHggcErrors(hggcGraphLaunch(graphExec, 0));
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    // Verify solution
+    float h_x[N];
+    checkHggcErrors(hggcMemcpy(h_x, d_x_new, N * sizeof(float), hggcMemcpyDeviceToHost));
+
+    float max_err = 0.0f;
+    for (int i = 0; i < N; ++i)
+        max_err = fmaxf(max_err, fabsf(h_x[i] - 1.0f));
+
+    bool pass = (max_err < 0.01f);
+    printf("  Max error vs exact solution: %e\n", max_err);
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+
+    // Cleanup
+    checkHggcErrors(hggcGraphExecDestroy(graphExec));
+    checkHggcErrors(hggcGraphDestroy(graph));
+    checkHggcErrors(hggcFree(d_x_old));
+    checkHggcErrors(hggcFree(d_x_new));
+    checkHggcErrors(hggcFree(d_b));
+    checkHggcErrors(hggcFree(d_iter));
+
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

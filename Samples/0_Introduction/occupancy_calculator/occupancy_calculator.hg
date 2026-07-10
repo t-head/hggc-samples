@@ -1,0 +1,148 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <helper_hggc.h>
+#include <iostream>
+
+namespace {
+constexpr int kManualBlockSize = 32;
+constexpr int kDefaultElementCount = 1000000;
+}  // namespace
+
+/// Element-wise square kernel; declared with dynamic shared memory so that
+/// occupancy queries can include a non-zero smem footprint when desired.
+__global__ void square(int *dev_array, int element_count)
+{
+    extern __shared__ int dynamic_smem[];
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (idx < element_count) {
+        dev_array[idx] *= dev_array[idx];
+    }
+}
+
+/// Compute theoretical occupancy of @p kernel for @p blockSize and the given
+/// dynamic shared-memory footprint, expressed as active warps over max warps.
+static double compute_potential_occupancy(void *kernel, int blockSize, size_t dynamic_smem)
+{
+    int dev_id = 0;
+    hggcDeviceProp prop;
+    int active_blocks = 0;
+
+    checkHggcErrors(hggcGetDevice(&dev_id));
+    checkHggcErrors(hggcGetDeviceProperties(&prop, dev_id));
+    checkHggcErrors(hggcOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks, kernel, blockSize, dynamic_smem));
+
+    const int active_warps = active_blocks * blockSize / prop.warpSize;
+    const int max_warps    = prop.maxThreadsPerMultiProcessor / prop.warpSize;
+    return static_cast<double>(active_warps) / max_warps;
+}
+
+/// Launch the square kernel using either a manual block size or the configurator
+/// suggestion, then report occupancy and elapsed time.
+static int run_launch(int *dev_array, int element_count, bool use_auto_config)
+{
+    int blockSize    = 0;
+    int min_grid_size = 0;
+    int grid_size     = 0;
+    size_t dynamic_smem = 0;
+
+    hggcEvent_t evt_begin;
+    hggcEvent_t evt_end;
+    float elapsed_ms = 0.0f;
+
+    checkHggcErrors(hggcEventCreate(&evt_begin));
+    checkHggcErrors(hggcEventCreate(&evt_end));
+
+    if (use_auto_config) {
+        checkHggcErrors(hggcOccupancyMaxPotentialBlockSize(
+            &min_grid_size, &blockSize, (void *)square, dynamic_smem, element_count));
+
+        std::cout << "Suggested block size: " << blockSize << std::endl
+                  << "Minimum grid size for maximum occupancy: " << min_grid_size << std::endl;
+    }
+    else {
+        // Intentionally undersized to illustrate the impact of a low block size
+        // on achievable warp occupancy.
+        blockSize = kManualBlockSize;
+    }
+
+    grid_size = (element_count + blockSize - 1) / blockSize;
+
+    checkHggcErrors(hggcEventRecord(evt_begin));
+    square<<<grid_size, blockSize, dynamic_smem>>>(dev_array, element_count);
+    checkHggcErrors(hggcEventRecord(evt_end));
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    const double occupancy = compute_potential_occupancy((void *)square, blockSize, dynamic_smem);
+    std::cout << "Potential occupancy: " << occupancy * 100 << "%" << std::endl;
+
+    checkHggcErrors(hggcEventElapsedTime(&elapsed_ms, evt_begin, evt_end));
+    std::cout << "Elapsed time: " << elapsed_ms << "ms" << std::endl;
+
+    return 0;
+}
+
+/// Generate a ramp, square it on device, and verify host results.
+static int run_test(bool use_auto_config, int element_count = kDefaultElementCount)
+{
+    const int byte_size = element_count * static_cast<int>(sizeof(int));
+    int *host_array = new int[element_count];
+    int *dev_array  = nullptr;
+
+    for (int i = 0; i < element_count; ++i) {
+        host_array[i] = i;
+    }
+
+    checkHggcErrors(hggcMalloc(&dev_array, byte_size));
+    checkHggcErrors(hggcMemcpy(dev_array, host_array, byte_size, hggcMemcpyHostToDevice));
+
+    for (int i = 0; i < element_count; ++i) {
+        host_array[i] = 0;
+    }
+
+    run_launch(dev_array, element_count, use_auto_config);
+
+    checkHggcErrors(hggcMemcpy(host_array, dev_array, byte_size, hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcFree(dev_array));
+
+    for (int i = 0; i < element_count; ++i) {
+        if (host_array[i] != i * i) {
+            std::cout << "element " << i << " expected " << i * i
+                      << " actual " << host_array[i] << std::endl;
+            delete[] host_array;
+            return 1;
+        }
+    }
+    delete[] host_array;
+    return 0;
+}
+
+int main()
+{
+    std::cout << "starting Occupancy Calculator" << std::endl << std::endl;
+
+    std::cout << "[ Manual configuration with " << kManualBlockSize
+              << " threads per block ]" << std::endl;
+    if (run_test(false) != 0) {
+        std::cerr << "Test failed\n" << std::endl;
+        return -1;
+    }
+    std::cout << std::endl;
+
+    std::cout << "[ Automatic, occupancy-based configuration ]" << std::endl;
+    if (run_test(true) != 0) {
+        std::cerr << "Test failed\n" << std::endl;
+        return -1;
+    }
+
+    std::cout << std::endl << "Test PASSED\n" << std::endl;
+    return 0;
+}

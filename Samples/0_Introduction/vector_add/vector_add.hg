@@ -1,0 +1,114 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * vector_add.hg -- Weighted vector linear combination (Runtime API)
+ *
+ * Computes out[i] = alpha * x[i] + beta * y[i] + gamma on PPU.
+ */
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+
+namespace {
+
+constexpr int   kNumElements = 65536;
+constexpr int   kBlockDim    = 256;
+constexpr float kAlpha       = 2.5f;
+constexpr float kBeta        = -1.5f;
+constexpr float kGamma       = 100.0f;
+constexpr float kRelTol      = 1e-5f;
+
+}  // namespace
+
+/* ── Device kernel: weighted linear combination ────────────── */
+
+__global__ void weighted_sum_kernel(
+    const float *x, const float *y, float *out,
+    int n, float alpha, float beta, float gamma)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        out[idx] = alpha * x[idx] + beta * y[idx] + gamma;
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(void)
+{
+    const size_t bytes = static_cast<size_t>(kNumElements) * sizeof(float);
+
+    printf("[vector_add] Weighted Linear Combination\n");
+    printf("  N = %d, alpha = %.2f, beta = %.2f, gamma = %.2f\n\n",
+           kNumElements, kAlpha, kBeta, kGamma);
+
+    /* Allocate and fill host arrays with deterministic sinusoidal data */
+    float *h_x   = static_cast<float *>(malloc(bytes));
+    float *h_y   = static_cast<float *>(malloc(bytes));
+    float *h_out = static_cast<float *>(malloc(bytes));
+
+    for (int i = 0; i < kNumElements; i++) {
+        h_x[i] = sinf(static_cast<float>(i) * 0.01f);
+        h_y[i] = cosf(static_cast<float>(i) * 0.01f);
+    }
+
+    /* Allocate device arrays */
+    float *d_x   = nullptr;
+    float *d_y   = nullptr;
+    float *d_out = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_x),   bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_y),   bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out), bytes));
+
+    /* Copy to device */
+    checkHggcErrors(hggcMemcpy(d_x, h_x, bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_y, h_y, bytes, hggcMemcpyHostToDevice));
+
+    /* Launch kernel */
+    int grid = (kNumElements + kBlockDim - 1) / kBlockDim;
+    printf("  Launch: %d blocks x %d threads\n", grid, kBlockDim);
+    weighted_sum_kernel<<<grid, kBlockDim>>>(
+        d_x, d_y, d_out, kNumElements, kAlpha, kBeta, kGamma);
+    checkHggcErrors(hggcGetLastError());
+
+    /* Copy back */
+    checkHggcErrors(hggcMemcpy(h_out, d_out, bytes, hggcMemcpyDeviceToHost));
+
+    /* Verify with relative error */
+    int mismatches = 0;
+    for (int i = 0; i < kNumElements; i++) {
+        float expected = kAlpha * h_x[i] + kBeta * h_y[i] + kGamma;
+        float diff = h_out[i] - expected;
+        if (diff < 0) diff = -diff;
+        float denom = expected;
+        if (denom < 0) denom = -denom;
+        if (denom < 1.0f) denom = 1.0f;
+        if (diff / denom > kRelTol) {
+            if (mismatches < 5)
+                printf("  MISMATCH [%d]: got %.6f, expected %.6f\n", i, h_out[i], expected);
+            mismatches++;
+        }
+    }
+
+    printf("  Mismatches: %d / %d\n", mismatches, kNumElements);
+    printf("  Result: %s\n", mismatches == 0 ? "PASS" : "FAIL");
+
+    /* Cleanup */
+    checkHggcErrors(hggcFree(d_x));
+    checkHggcErrors(hggcFree(d_y));
+    checkHggcErrors(hggcFree(d_out));
+    free(h_x);
+    free(h_y);
+    free(h_out);
+
+    return mismatches == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}

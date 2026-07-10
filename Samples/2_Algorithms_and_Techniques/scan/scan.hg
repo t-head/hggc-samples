@@ -1,0 +1,212 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * scan -- Multi-block Exclusive Prefix Sum (Blelloch Algorithm)
+ *
+ * Implements an arbitrary-length exclusive prefix sum using the classic
+ * Blelloch (up-sweep / down-sweep) work-efficient algorithm:
+ *
+ *   Pass 1: block_scan    -- each block scans its chunk, writes block total
+ *   Pass 2: block_scan    -- scan the array of block totals (single block)
+ *   Pass 3: propagate     -- add block prefix to every element
+ *
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int kBlockSize = 256;
+// Each block handles 2*kBlockSize elements (work-efficient: 2 elements/thread)
+constexpr int ELEMS_PER_BLOCK = 2 * kBlockSize;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Blelloch block-level exclusive scan kernel
+// ═══════════════════════════════════════════════════════════════════════
+// Each block processes ELEMS_PER_BLOCK elements.
+// Writes the block total to block_sums[blockIdx.x] for the second pass.
+
+__global__ void block_scan_kernel(
+    unsigned int       * __restrict__ output,
+    const unsigned int * __restrict__ input,
+    unsigned int       * __restrict__ block_sums,
+    int n)
+{
+    __shared__ unsigned int s_data[ELEMS_PER_BLOCK];
+
+    int tid = threadIdx.x;
+    int base = blockIdx.x * ELEMS_PER_BLOCK;
+
+    // Load input into shared memory (two elements per thread).
+    int i0 = base + tid;
+    int i1 = base + tid + kBlockSize;
+    s_data[tid]              = (i0 < n) ? input[i0] : 0;
+    s_data[tid + kBlockSize] = (i1 < n) ? input[i1] : 0;
+    __syncthreads();
+
+    // ---- Up-sweep (reduce) phase ----
+    // Build partial sums bottom-up in a tree structure.
+    int offset = 1;
+    for (int d = ELEMS_PER_BLOCK >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            s_data[bi] += s_data[ai];
+        }
+        offset <<= 1;
+    }
+
+    // Save block total and clear the last element for down-sweep.
+    if (tid == 0) {
+        if (block_sums != nullptr) {
+            block_sums[blockIdx.x] = s_data[ELEMS_PER_BLOCK - 1];
+        }
+        s_data[ELEMS_PER_BLOCK - 1] = 0;
+    }
+
+    // ---- Down-sweep phase ----
+    // Traverse tree from root, distributing partial sums.
+    for (int d = 1; d < ELEMS_PER_BLOCK; d <<= 1) {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            unsigned int temp = s_data[ai];
+            s_data[ai] = s_data[bi];
+            s_data[bi] += temp;
+        }
+    }
+    __syncthreads();
+
+    // Write results.
+    if (i0 < n) output[i0] = s_data[tid];
+    if (i1 < n) output[i1] = s_data[tid + kBlockSize];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Propagate block prefixes to all elements
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void propagate_kernel(
+    unsigned int * __restrict__ data,
+    const unsigned int * __restrict__ block_prefixes,
+    int n)
+{
+    int base = blockIdx.x * ELEMS_PER_BLOCK;
+    int i0 = base + threadIdx.x;
+    int i1 = base + threadIdx.x + kBlockSize;
+
+    unsigned int prefix = block_prefixes[blockIdx.x];
+    if (i0 < n) data[i0] += prefix;
+    if (i1 < n) data[i1] += prefix;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host: multi-block exclusive prefix sum
+// ═══════════════════════════════════════════════════════════════════════
+
+static void exclusive_scan_gpu(unsigned int *d_out, const unsigned int *d_in, int n)
+{
+    int num_blocks = (n + ELEMS_PER_BLOCK - 1) / ELEMS_PER_BLOCK;
+
+    unsigned int *d_block_sums = nullptr;
+    unsigned int *d_block_prefixes = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_block_sums), num_blocks * sizeof(unsigned int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_block_prefixes), num_blocks * sizeof(unsigned int)));
+
+    // Pass 1: scan each block, collect block totals.
+    block_scan_kernel<<<num_blocks, kBlockSize>>>(d_out, d_in, d_block_sums, n);
+    getLastHggcError("block_scan_kernel (pass 1) failed");
+
+    // Pass 2: scan the block totals (fits in one block for <= 512 blocks).
+    // For larger grids a recursive approach would be needed; here we cap at
+    // ELEMS_PER_BLOCK blocks which supports up to 512*512 = 262144 elements.
+    block_scan_kernel<<<1, kBlockSize>>>(d_block_prefixes, d_block_sums, nullptr, num_blocks);
+    getLastHggcError("block_scan_kernel (pass 2) failed");
+
+    // Pass 3: add block prefix to every element.
+    propagate_kernel<<<num_blocks, kBlockSize>>>(d_out, d_block_prefixes, n);
+    getLastHggcError("propagate_kernel failed");
+
+    checkHggcErrors(hggcFree(d_block_sums));
+    checkHggcErrors(hggcFree(d_block_prefixes));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CPU reference
+// ═══════════════════════════════════════════════════════════════════════
+
+static void exclusive_scan_cpu(unsigned int *out, const unsigned int *in, int n)
+{
+    out[0] = 0;
+    for (int i = 1; i < n; ++i) {
+        out[i] = out[i - 1] + in[i - 1];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[scan] Multi-block Exclusive Prefix Sum (Blelloch)\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    // Test multiple sizes including non-power-of-two.
+    const int sizes[] = {512, 1024, 4096, 10000, 65536, 131072};
+    const int num_tests = sizeof(sizes) / sizeof(sizes[0]);
+    bool all_pass = true;
+
+    for (int t = 0; t < num_tests; ++t) {
+        int n = sizes[t];
+
+        // Host data.
+        unsigned int *h_in  = (unsigned int *)malloc(n * sizeof(unsigned int));
+        unsigned int *h_ref = (unsigned int *)malloc(n * sizeof(unsigned int));
+        unsigned int *h_out = (unsigned int *)malloc(n * sizeof(unsigned int));
+        for (int i = 0; i < n; ++i) h_in[i] = (unsigned int)((i * 3 + 7) % 13);
+
+        exclusive_scan_cpu(h_ref, h_in, n);
+
+        // Device.
+        unsigned int *d_in, *d_out;
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_in),  n * sizeof(unsigned int)));
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out), n * sizeof(unsigned int)));
+        checkHggcErrors(hggcMemcpy(d_in, h_in, n * sizeof(unsigned int), hggcMemcpyHostToDevice));
+
+        HggcTimer timer;
+        timer.start();
+        exclusive_scan_gpu(d_out, d_in, n);
+        checkHggcErrors(hggcDeviceSynchronize());
+        timer.stop();
+
+        checkHggcErrors(hggcMemcpy(h_out, d_out, n * sizeof(unsigned int), hggcMemcpyDeviceToHost));
+
+        // Validate.
+        bool pass = (memcmp(h_out, h_ref, n * sizeof(unsigned int)) == 0);
+        all_pass = all_pass && pass;
+        printf("  n=%6d  %.3f ms  %s\n", n, timer.elapsed(), pass ? "PASS" : "FAIL");
+
+        free(h_in); free(h_ref); free(h_out);
+        checkHggcErrors(hggcFree(d_in));
+        checkHggcErrors(hggcFree(d_out));
+    }
+
+    printf("\n  Result: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

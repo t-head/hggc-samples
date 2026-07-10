@@ -1,0 +1,218 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * cpp_template_kernels — Policy-based templated parallel reduction
+ *
+ * Demonstrates:
+ *   - Template template parameters for pluggable reduction policies
+ *   - Dynamic shared-memory allocation via type-safe DynamicSharedBuffer<T>
+ *   - Partial template specialization for identity values
+ *   - Multi-type / multi-operation dispatch from a single kernel
+ */
+#include <cfloat>
+#include <climits>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+#include "shared_mem_traits.hgh"
+
+namespace {
+int g_total_failures = 0;
+constexpr int kBlockSize = 256;
+constexpr int kNumElements = 4096;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Reduction policy classes — each provides combine() and identity().
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Sum reduction policy.
+template <typename T>
+struct SumOp
+{
+    __host__ __device__ static T combine(T a, T b) { return a + b; }
+    __host__ __device__ static T identity() { return static_cast<T>(0); }
+    static const char *name() { return "Sum"; }
+};
+
+/// Max reduction policy.
+template <typename T>
+struct MaxOp
+{
+    __host__ __device__ static T combine(T a, T b) { return (a > b) ? a : b; }
+    __host__ __device__ static T identity();
+    static const char *name() { return "Max"; }
+};
+
+// Identity specializations — the "lowest possible value" per type.
+template <> __host__ __device__ float MaxOp<float>::identity() { return -FLT_MAX; }
+template <> __host__ __device__ int   MaxOp<int>::identity()   { return INT_MIN; }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Templated reduction kernel — uses DynamicSharedBuffer<T> for shared mem
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Block-level tree reduction.  Each block reduces its portion of the input
+/// and writes a single partial result to g_out[blockIdx.x].
+template <typename T, template <typename> class Op>
+__global__ void reduce_kernel(const T *g_in, T *g_out, int n)
+{
+    DynamicSharedBuffer<T> buf;
+    T *sdata = buf.data();
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * (blockDim.x * 2) + tid;
+
+    // Each thread loads two elements and combines them.
+    T val = Op<T>::identity();
+    if (gid < n)              val = Op<T>::combine(val, g_in[gid]);
+    if (gid + blockDim.x < n) val = Op<T>::combine(val, g_in[gid + blockDim.x]);
+    sdata[tid] = val;
+    __syncthreads();
+
+    // Tree reduction in shared memory.
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] = Op<T>::combine(sdata[tid], sdata[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        g_out[blockIdx.x] = sdata[0];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CPU reference — same policy pattern on the host side
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename T, template <typename> class Op>
+T reduce_reference(const T *data, int n)
+{
+    T acc = Op<T>::identity();
+    for (int i = 0; i < n; ++i) {
+        acc = Op<T>::combine(acc, data[i]);
+    }
+    return acc;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Per-type, per-op dispatch: allocate → launch → verify → free
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename T, template <typename> class Op>
+void dispatch_reduce(int argc, char **argv)
+{
+    const int n = kNumElements;
+    const size_t bytes = sizeof(T) * n;
+
+    printf("  [%s<%s>]  n=%d\n", Op<T>::name(),
+           (sizeof(T) == sizeof(float)) ? "float" : "int", n);
+
+    // Host input with deterministic data.
+    T *h_in = static_cast<T *>(malloc(bytes));
+    for (int i = 0; i < n; ++i) {
+        h_in[i] = static_cast<T>((i % 127) - 63);  // range [-63, 63]
+    }
+
+    // Device allocations.
+    const int grid_size    = (n + kBlockSize * 2 - 1) / (kBlockSize * 2);
+    const size_t out_bytes = sizeof(T) * grid_size;
+
+    T *d_in  = nullptr;
+    T *d_out = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_in),  bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out), out_bytes));
+    checkHggcErrors(hggcMemcpy(d_in, h_in, bytes, hggcMemcpyHostToDevice));
+
+    // Launch: first pass.
+    HggcTimer timer;
+    timer.start();
+
+    dim3 block(kBlockSize);
+    dim3 grid(grid_size);
+    const size_t smem_bytes = sizeof(T) * kBlockSize;
+
+    reduce_kernel<T, Op><<<grid, block, smem_bytes>>>(d_in, d_out, n);
+    getLastHggcError("reduce_kernel launch failed");
+
+    // If grid > 1, do a final reduction pass on the partial results.
+    if (grid_size > 1) {
+        // Copy partials back and reduce on a single block.
+        T *d_final = nullptr;
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_final), sizeof(T)));
+        dim3 grid2(1);
+        dim3 block2(grid_size < kBlockSize ? grid_size : kBlockSize);
+        const size_t smem2 = sizeof(T) * block2.x;
+        reduce_kernel<T, Op><<<grid2, block2, smem2>>>(d_out, d_final, grid_size);
+        getLastHggcError("reduce_kernel (final pass) launch failed");
+
+        checkHggcErrors(hggcDeviceSynchronize());
+        timer.stop();
+
+        T gpu_result;
+        checkHggcErrors(hggcMemcpy(&gpu_result, d_final, sizeof(T), hggcMemcpyDeviceToHost));
+        checkHggcErrors(hggcFree(d_final));
+
+        // CPU reference.
+        T cpu_result = reduce_reference<T, Op>(h_in, n);
+
+        const bool ok = (gpu_result == cpu_result);
+        printf("    PPU=%d  CPU=%d  %s  (%.3f ms)\n",
+               static_cast<int>(gpu_result), static_cast<int>(cpu_result),
+               ok ? "PASS" : "FAIL", timer.elapsed());
+        g_total_failures += (ok ? 0 : 1);
+    } else {
+        checkHggcErrors(hggcDeviceSynchronize());
+        timer.stop();
+
+        T gpu_result;
+        checkHggcErrors(hggcMemcpy(&gpu_result, d_out, sizeof(T), hggcMemcpyDeviceToHost));
+
+        T cpu_result = reduce_reference<T, Op>(h_in, n);
+
+        const bool ok = (gpu_result == cpu_result);
+        printf("    PPU=%d  CPU=%d  %s  (%.3f ms)\n",
+               static_cast<int>(gpu_result), static_cast<int>(cpu_result),
+               ok ? "PASS" : "FAIL", timer.elapsed());
+        g_total_failures += (ok ? 0 : 1);
+    }
+
+    free(h_in);
+    checkHggcErrors(hggcFree(d_in));
+    checkHggcErrors(hggcFree(d_out));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// main — run all combinations of {float, int} × {Sum, Max}
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[cpp_template_kernels] Policy-based parallel reduction\n\n");
+
+    int dev_id = findHggcDevice(argc, (const char **)argv);
+    hggcDeviceProp props;
+    checkHggcErrors(hggcGetDeviceProperties(&props, dev_id));
+    printf("Device: %s (%d compute units)\n\n", props.name, props.multiProcessorCount);
+
+    dispatch_reduce<float, SumOp>(argc, argv);
+    dispatch_reduce<float, MaxOp>(argc, argv);
+    dispatch_reduce<int,   SumOp>(argc, argv);
+    dispatch_reduce<int,   MaxOp>(argc, argv);
+
+    printf("\n[cpp_template_kernels] Test Results: %d Failures\n", g_total_failures);
+    return (g_total_failures == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

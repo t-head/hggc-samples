@@ -1,0 +1,223 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * graph_memory_nodes -- Graph Construction: API vs Stream Capture
+ *
+ * Builds the exact same computation graph two different ways and
+ * verifies they produce identical results:
+ *
+ *   Method 1: Explicit Graph API (hggcGraphAddKernelNode, AddMemcpyNode, etc.)
+ *   Method 2: Stream Capture (hggcStreamBeginCapture + normal kernel launches)
+ *
+ * Computation: input -> scale(x2) -> bias(+1) -> output
+ *
+ * Educational point:
+ *   - Stream Capture: fewer lines, mirrors regular HGGC code
+ *   - Graph API: more verbose but offers fine-grained dependency control
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int N = 4096;
+constexpr int BLOCK = 256;
+constexpr int GRID = (N + BLOCK - 1) / BLOCK;
+}  // namespace
+
+// ---- Device kernels ----
+
+__global__ void copy_and_scale_kernel(const float *input, float *output, float factor, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = input[i] * factor;
+}
+
+__global__ void copy_and_bias_kernel(const float *input, float *output, float bias, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = input[i] + bias;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Method 1: Build graph via explicit Graph API
+// ═══════════════════════════════════════════════════════════════════════
+
+static hggcGraphExec_t build_graph_api(float *d_output, const float *d_input, int n, int device)
+{
+    hggcGraph_t graph;
+    checkHggcErrors(hggcGraphCreate(&graph, 0));
+
+    size_t bytes = n * sizeof(float);
+
+    // Node 1: Allocate temporary buffer (graph memory node)
+    hggcGraphNode_t allocNode;
+    hggcMemAllocNodeParams allocParams = {};
+    allocParams.bytesize = bytes;
+    allocParams.poolProps.allocType = hggcMemAllocationTypePinned;
+    allocParams.poolProps.location.id = device;
+    allocParams.poolProps.location.type = hggcMemLocationTypeDevice;
+    checkHggcErrors(hggcGraphAddMemAllocNode(&allocNode, graph, NULL, 0, &allocParams));
+    float *d_tmp = (float *)allocParams.dptr;
+
+    // Node 2: copy_and_scale kernel (input -> tmp, x2)
+    hggcGraphNode_t scaleNode;
+    {
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)copy_and_scale_kernel;
+        kp.gridDim = dim3(GRID);
+        kp.blockDim = dim3(BLOCK);
+        float factor = 2.0f;
+        int nn = n;
+        void *args[] = {(void *)&d_input, &d_tmp, &factor, &nn};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&scaleNode, graph, &allocNode, 1, &kp));
+    }
+
+    // Node 3: bias kernel (tmp -> output, +1)
+    hggcGraphNode_t biasNode;
+    {
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)copy_and_bias_kernel;
+        kp.gridDim = dim3(GRID);
+        kp.blockDim = dim3(BLOCK);
+        float bias = 1.0f;
+        int nn = n;
+        void *args[] = {(void *)&d_tmp, &d_output, &bias, &nn};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&biasNode, graph, &scaleNode, 1, &kp));
+    }
+
+    // Node 4: Free temporary buffer (graph memory node)
+    hggcGraphNode_t freeNode;
+    checkHggcErrors(hggcGraphAddMemFreeNode(&freeNode, graph, &biasNode, 1, (void *)d_tmp));
+
+    hggcGraphExec_t exec;
+    checkHggcErrors(hggcGraphInstantiate(&exec, graph, NULL, NULL, 0));
+    checkHggcErrors(hggcGraphDestroy(graph));
+    return exec;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Method 2: Build graph via Stream Capture
+// ═══════════════════════════════════════════════════════════════════════
+
+static hggcGraphExec_t build_stream_capture(float *d_output, const float *d_input, int n)
+{
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+
+    size_t bytes = n * sizeof(float);
+
+    // Begin capture -- everything launched on this stream becomes graph nodes
+    checkHggcErrors(hggcStreamBeginCapture(stream, hggcStreamCaptureModeGlobal));
+
+    // Allocate temp buffer (captured as MemAllocNode)
+    float *d_tmp;
+    checkHggcErrors(hggcMallocAsync(&d_tmp, bytes, stream));
+
+    // Same computation as Method 1
+    float factor = 2.0f;
+    int nn = n;
+    copy_and_scale_kernel<<<GRID, BLOCK, 0, stream>>>(d_input, d_tmp, factor, nn);
+
+    float bias = 1.0f;
+    copy_and_bias_kernel<<<GRID, BLOCK, 0, stream>>>(d_tmp, d_output, bias, nn);
+
+    // Free temp buffer (captured as MemFreeNode)
+    checkHggcErrors(hggcFreeAsync(d_tmp, stream));
+
+    // End capture -- produces a graph
+    hggcGraph_t graph;
+    checkHggcErrors(hggcStreamEndCapture(stream, &graph));
+    checkHggcErrors(hggcStreamDestroy(stream));
+
+    hggcGraphExec_t exec;
+    checkHggcErrors(hggcGraphInstantiate(&exec, graph, NULL, NULL, 0));
+    checkHggcErrors(hggcGraphDestroy(graph));
+    return exec;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[graph_memory_nodes] Graph Construction: API vs Stream Capture\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    size_t bytes = N * sizeof(float);
+
+    // Host input
+    float *h_input = (float *)malloc(bytes);
+    for (int i = 0; i < N; ++i) h_input[i] = (float)i;
+
+    // Device buffers
+    float *d_input, *d_data1, *d_data2;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input), bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data1), bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data2), bytes));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, bytes, hggcMemcpyHostToDevice));
+
+    // Build graphs both ways
+    printf("  Method 1: Explicit Graph API (MemAlloc/Free nodes)...\n");
+    hggcGraphExec_t exec1 = build_graph_api(d_data1, d_input, N, 0);
+
+    printf("  Method 2: Stream Capture (hggcMallocAsync/FreeAsync)...\n");
+    hggcGraphExec_t exec2 = build_stream_capture(d_data2, d_input, N);
+
+    // Launch both
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+
+    checkHggcErrors(hggcGraphLaunch(exec1, stream));
+    checkHggcErrors(hggcGraphLaunch(exec2, stream));
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    // Read back results
+    float *h_out1 = (float *)malloc(bytes);
+    float *h_out2 = (float *)malloc(bytes);
+    checkHggcErrors(hggcMemcpy(h_out1, d_data1, bytes, hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_out2, d_data2, bytes, hggcMemcpyDeviceToHost));
+
+    // Verify: both should produce input*2 + 1
+    bool pass = true;
+    for (int i = 0; i < N; ++i) {
+        float expected = (float)i * 2.0f + 1.0f;
+        if (fabsf(h_out1[i] - expected) > 1e-5f ||
+            fabsf(h_out2[i] - expected) > 1e-5f ||
+            fabsf(h_out1[i] - h_out2[i]) > 1e-5f) {
+            printf("  MISMATCH at [%d]: api=%f capture=%f expected=%f\n",
+                   i, h_out1[i], h_out2[i], expected);
+            pass = false;
+            break;
+        }
+    }
+
+    printf("\n  Both methods produce identical results: %s\n", pass ? "YES" : "NO");
+
+    // Cleanup
+    checkHggcErrors(hggcGraphExecDestroy(exec1));
+    checkHggcErrors(hggcGraphExecDestroy(exec2));
+    checkHggcErrors(hggcStreamDestroy(stream));
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_data1));
+    checkHggcErrors(hggcFree(d_data2));
+    free(h_input); free(h_out1); free(h_out2);
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

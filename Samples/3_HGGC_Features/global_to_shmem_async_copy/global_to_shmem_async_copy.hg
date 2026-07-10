@@ -1,0 +1,233 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * global_to_shmem_async_copy -- Async Copy Synchronization Strategies
+ *
+ * Compares three synchronization approaches for global->shared memory
+ * async copy, with increasing hardware utilization:
+ *
+ *   1. Naive: explicit load through registers + __syncthreads()
+ *   2. cp.async + commit_group/wait_group: classic async pipeline
+ *   3. cp.async + awbar: arrive-wait barrier (finer granularity)
+ *
+ * Payload: block-level vector copy + reduction (simple, focuses on sync)
+ * Each strategy copies a large array tile-by-tile into shared memory,
+ * reduces each tile, and accumulates the partial sums.
+ */
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int kBlockSize = 256;
+constexpr int TILE_SIZE  = 256;  // elements per tile (= kBlockSize)
+constexpr int N          = 256 * 1024;  // total elements
+constexpr int NUM_TILES  = N / TILE_SIZE;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 1: Naive (register load + __syncthreads)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void reduce_naive(const float * __restrict__ input, float *output, int n)
+{
+    __shared__ float smem[TILE_SIZE];
+
+    float block_sum = 0.0f;
+
+    for (int tile = blockIdx.x; tile < NUM_TILES; tile += gridDim.x) {
+        int idx = tile * TILE_SIZE + threadIdx.x;
+
+        // Explicit load: global -> register -> shared
+        smem[threadIdx.x] = (idx < n) ? input[idx] : 0.0f;
+        __syncthreads();
+
+        // Tree reduction in shared memory
+        for (int s = kBlockSize / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) block_sum += smem[0];
+    }
+
+    if (threadIdx.x == 0) atomicAdd(output, block_sum);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 2: cp.async + commit_group / wait_group
+// ═══════════════════════════════════════════════════════════════════════
+// Uses TIX ppu.cp.async for async global->shared, synchronized by
+// commit_group/wait_group
+
+__global__ void reduce_cpasync_waitgroup(const float * __restrict__ input, float *output, int n)
+{
+    __shared__ float smem[TILE_SIZE];
+
+    float block_sum = 0.0f;
+
+    for (int tile = blockIdx.x; tile < NUM_TILES; tile += gridDim.x) {
+        int idx = tile * TILE_SIZE + threadIdx.x;
+
+        // Async copy: 4 bytes (1 float) per thread
+        unsigned int smem_addr;
+        asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(smem_addr) : "l"(&smem[threadIdx.x]));
+        const float *src = (idx < n) ? &input[idx] : nullptr;
+
+        if (src) {
+            asm volatile("ppu.cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(smem_addr), "l"(src));
+        }
+        asm volatile("ppu.cp.async.commit_group;");
+        asm volatile("ppu.cp.async.wait_group 0;");
+        __syncthreads();
+
+        // Reduction (same as naive)
+        for (int s = kBlockSize / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) block_sum += smem[0];
+    }
+
+    if (threadIdx.x == 0) atomicAdd(output, block_sum);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 3: cp.async + awbar (arrive-wait barrier)
+// ═══════════════════════════════════════════════════════════════════════
+// Uses the awbar mechanism:
+//   - awbar.init: initialize barrier with thread count
+//   - cp.async.awbar.arrive: link async copies to barrier (auto-arrive on completion)
+//   - awbar.arrive: thread explicitly arrives
+//   - awbar.test_wait: poll until all arrivals (copies + threads) complete
+//
+// Advantage over commit_group/wait_group: awbar integrates thread sync
+// and async-copy completion into a single unified primitive.
+
+__global__ void reduce_cpasync_awbar(const float * __restrict__ input, float *output, int n)
+{
+    // awbar object in shared memory (must be 64-byte aligned, 8 bytes)
+    __shared__ __align__(64) char awbar_storage[64];
+    __shared__ float smem[TILE_SIZE];
+
+    float block_sum = 0.0f;
+
+    // Initialize awbar: blockDim.x threads will participate
+    unsigned int awbar_addr;
+    asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(awbar_addr) : "l"(awbar_storage));
+
+    if (threadIdx.x == 0) {
+        asm volatile("ppu.awbar.init.shared.b64 [%0], %1;" :: "r"(awbar_addr), "r"(kBlockSize));
+    }
+    __syncthreads();
+
+    for (int tile = blockIdx.x; tile < NUM_TILES; tile += gridDim.x) {
+        int idx = tile * TILE_SIZE + threadIdx.x;
+
+        // Async copy
+        unsigned int smem_addr;
+        asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(smem_addr) : "l"(&smem[threadIdx.x]));
+        const float *src = (idx < n) ? &input[idx] : nullptr;
+
+        if (src) {
+            asm volatile("ppu.cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(smem_addr), "l"(src));
+        }
+
+        // Link async copies to awbar (auto-arrive when copy completes)
+        asm volatile("ppu.cp.async.awbar.arrive.shared.b64 [%0];" :: "r"(awbar_addr));
+
+        // Thread arrives at awbar
+        unsigned long long state;
+        asm volatile("ppu.awbar.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(awbar_addr));
+
+        // Wait until all arrivals complete (copies + threads)
+        int complete = 0;
+        do {
+            asm volatile("ppu.awbar.test_wait.shared.b64 %0, [%1], %2;"
+                         : "=r"(complete) : "r"(awbar_addr), "l"(state));
+        } while (!complete);
+
+        // At this point: all async copies done AND all threads synchronized
+        // Reduction
+        for (int s = kBlockSize / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+            // Need sync between reduction steps
+            asm volatile("ppu.awbar.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(awbar_addr));
+            do {
+                asm volatile("ppu.awbar.test_wait.shared.b64 %0, [%1], %2;"
+                             : "=r"(complete) : "r"(awbar_addr), "l"(state));
+            } while (!complete);
+        }
+
+        if (threadIdx.x == 0) block_sum += smem[0];
+    }
+
+    if (threadIdx.x == 0) atomicAdd(output, block_sum);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[global_to_shmem_async_copy] Async Copy Synchronization Strategies\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    printf("  N = %d elements, TILE = %d, %d tiles\n\n", N, TILE_SIZE, NUM_TILES);
+
+    // Host data
+    float *h_input = (float *)malloc(N * sizeof(float));
+    for (int i = 0; i < N; ++i) h_input[i] = 1.0f;  // sum should = N
+
+    float *d_input, *d_output;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output), sizeof(float)));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, N * sizeof(float), hggcMemcpyHostToDevice));
+
+    float expected = (float)N;
+    bool all_pass = true;
+    int grid = 64;  // use fewer blocks to exercise multi-tile loop
+
+    struct { const char *name; void (*fn)(const float*, float*, int); } strategies[] = {
+        {"Naive (__syncthreads)",           reduce_naive},
+        {"cp.async + wait_group",           reduce_cpasync_waitgroup},
+        {"cp.async + awbar", reduce_cpasync_awbar},
+    };
+
+    for (auto &s : strategies) {
+        checkHggcErrors(hggcMemset(d_output, 0, sizeof(float)));
+
+        HggcTimer timer;
+        timer.start();
+        s.fn<<<grid, kBlockSize>>>(d_input, d_output, N);
+        getLastHggcError(s.name);
+        checkHggcErrors(hggcDeviceSynchronize());
+        timer.stop();
+
+        float result;
+        checkHggcErrors(hggcMemcpy(&result, d_output, sizeof(float), hggcMemcpyDeviceToHost));
+
+        bool pass = (fabsf(result - expected) < 1.0f);
+        all_pass = all_pass && pass;
+        printf("  %-35s  %.3f ms  sum=%.0f  %s\n", s.name, timer.elapsed(), result, pass ? "PASS" : "FAIL");
+    }
+
+    free(h_input);
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_output));
+
+    printf("\n  Result: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

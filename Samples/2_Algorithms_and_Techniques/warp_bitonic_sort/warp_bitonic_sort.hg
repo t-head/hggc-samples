@@ -1,0 +1,187 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * warp_bitonic_sort -- Register-Only Bitonic Sort via Warp Shuffle
+ *
+ * Implements a complete 32-element bitonic sort entirely within a warp
+ * using __shfl_xor_sync -- no shared memory required.  Each lane holds
+ * one element; compare-and-swap partners are determined by XOR of lane
+ * indices (the defining property of bitonic networks).
+ *
+ * The sample then extends to block-level sorting by combining:
+ *   1. Warp-level bitonic sort (32 elements per warp, register-only)
+ *   2. Shared-memory merge of sorted warps into a block-sorted sequence
+ *
+ * This demonstrates a modern approach where warp-cooperative primitives
+ * replace traditional shared-memory-heavy implementations.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int WARP_SIZE  = 32;
+constexpr int kBlockSize = 256;
+constexpr int WARPS_PER_BLOCK = kBlockSize / WARP_SIZE;
+constexpr int N = 8192;  // total elements to sort (multiple of kBlockSize)
+constexpr unsigned int FULL_MASK = 0xFFFFFFFF;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Warp-level bitonic sort (32 elements, register-only)
+// ═══════════════════════════════════════════════════════════════════════
+// Each lane holds one value.  The bitonic network is:
+//   for each stage s in [1, log2(32)]:
+//     for each step d in [s, s-1, ..., 1]:
+//       partner = lane XOR (1 << (d-1))
+//       compare-swap based on sort direction for this subsequence
+
+__device__ __forceinline__ int warp_bitonic_sort_ascending(int val)
+{
+    // 5 stages for 32 elements (log2(32) = 5)
+    for (int stage = 1; stage <= 5; ++stage) {
+        for (int step = stage; step >= 1; --step) {
+            int mask = 1 << (step - 1);
+            int partner_val = __shfl_xor_sync(FULL_MASK, val, mask);
+
+            // Determine sort direction using block-global threadIdx.x
+            // so that adjacent warps sort in alternating directions,
+            // forming bitonic sequences for the block-level merge.
+            bool ascending_dir = ((threadIdx.x >> stage) & 1) == 0;
+            // Within the current step, lower-indexed lane keeps the min
+            // if ascending, max if descending.
+            bool is_lower = (threadIdx.x & mask) == 0;
+
+            if (ascending_dir == is_lower) {
+                // This lane should keep the smaller value
+                val = (val <= partner_val) ? val : partner_val;
+            } else {
+                // This lane should keep the larger value
+                val = (val >= partner_val) ? val : partner_val;
+            }
+        }
+    }
+    return val;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Block-level sort: warp sort + shared-memory bitonic merge
+// ═══════════════════════════════════════════════════════════════════════
+// Step 1: Each warp sorts its 32 elements via register shuffle.
+// Step 2: Merge sorted warps using shared memory bitonic merge network.
+
+__global__ void block_bitonic_sort_kernel(int *data, int n)
+{
+    __shared__ int s_data[kBlockSize];
+
+    int idx = blockIdx.x * kBlockSize + threadIdx.x;
+    int val = (idx < n) ? data[idx] : INT_MAX;
+
+    // Phase 1: warp-level sort (register only, no shared memory)
+    val = warp_bitonic_sort_ascending(val);
+
+    // Store warp-sorted results to shared memory for inter-warp merge
+    s_data[threadIdx.x] = val;
+    __syncthreads();
+
+    // Phase 2: bitonic merge of sorted warps in shared memory
+    // At this point we have WARPS_PER_BLOCK sorted sequences of 32 each.
+    // Continue the bitonic network from stage 6 (size=64) up to
+    // stage log2(kBlockSize).
+    for (int stage = 6; stage <= 8; ++stage) {  // 8 = log2(256)
+        for (int step = stage; step >= 1; --step) {
+            int mask = 1 << (step - 1);
+            int partner = threadIdx.x ^ mask;
+
+            int my_val = s_data[threadIdx.x];
+            int partner_val = s_data[partner];
+
+            bool ascending_dir = ((threadIdx.x >> stage) & 1) == 0;
+            bool is_lower = (threadIdx.x & mask) == 0;
+
+            if (ascending_dir == is_lower) {
+                s_data[threadIdx.x] = (my_val <= partner_val) ? my_val : partner_val;
+            } else {
+                s_data[threadIdx.x] = (my_val >= partner_val) ? my_val : partner_val;
+            }
+            __syncthreads();
+        }
+    }
+
+    // Write back
+    if (idx < n) data[idx] = s_data[threadIdx.x];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[warp_bitonic_sort] Register-Only Bitonic Sort via Warp Shuffle\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    printf("  Elements: %d  Block: %d  Warps/block: %d\n\n", N, kBlockSize, WARPS_PER_BLOCK);
+
+    // Generate random input.
+    int *h_data = (int *)malloc(N * sizeof(int));
+    int *h_ref  = (int *)malloc(N * sizeof(int));
+    srand(42);
+    for (int i = 0; i < N; ++i) h_data[i] = rand() % 100000;
+    memcpy(h_ref, h_data, N * sizeof(int));
+
+    // CPU reference: sort each block-sized chunk independently
+    // (since our kernel sorts per-block, not globally)
+    for (int b = 0; b < N / kBlockSize; ++b) {
+        std::sort(h_ref + b * kBlockSize, h_ref + (b + 1) * kBlockSize);
+    }
+
+    // Device sort.
+    int *d_data;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data), N * sizeof(int)));
+    checkHggcErrors(hggcMemcpy(d_data, h_data, N * sizeof(int), hggcMemcpyHostToDevice));
+
+    HggcTimer timer;
+    timer.start();
+    int grid = N / kBlockSize;
+    block_bitonic_sort_kernel<<<grid, kBlockSize>>>(d_data, N);
+    getLastHggcError("block_bitonic_sort_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+
+    printf("  PPU sort time: %.3f ms\n", timer.elapsed());
+
+    // Validate.
+    int *h_result = (int *)malloc(N * sizeof(int));
+    checkHggcErrors(hggcMemcpy(h_result, d_data, N * sizeof(int), hggcMemcpyDeviceToHost));
+
+    bool pass = (memcmp(h_result, h_ref, N * sizeof(int)) == 0);
+
+    if (!pass) {
+        // Find first mismatch for debugging.
+        for (int i = 0; i < N; ++i) {
+            if (h_result[i] != h_ref[i]) {
+                printf("  First mismatch at [%d]: got=%d  expected=%d\n", i, h_result[i], h_ref[i]);
+                break;
+            }
+        }
+    }
+
+    free(h_data); free(h_ref); free(h_result);
+    checkHggcErrors(hggcFree(d_data));
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

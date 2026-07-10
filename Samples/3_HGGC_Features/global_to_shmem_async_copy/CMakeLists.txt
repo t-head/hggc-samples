@@ -1,0 +1,2 @@
+add_executable(global_to_shmem_async_copy global_to_shmem_async_copy.hg)
+target_include_directories(global_to_shmem_async_copy PRIVATE ${COMMON_DIR})

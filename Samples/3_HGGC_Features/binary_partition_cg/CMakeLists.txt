@@ -1,0 +1,2 @@
+add_executable(binary_partition_cg binary_partition_cg.hg)
+target_include_directories(binary_partition_cg PRIVATE ${COMMON_DIR})

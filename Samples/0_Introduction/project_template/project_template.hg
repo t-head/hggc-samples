@@ -1,0 +1,144 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * project_template — GEMV (y = A·x) demo
+ *
+ * Demonstrates:
+ *   - Mixed .hg / .cpp compilation (kernel + CPU reference in separate files)
+ *   - Shared-memory tiling for the input vector
+ *   - Multi-block grid with one thread-row per output element
+ *   - Device ↔ Host memory transfer and result verification
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+// ── Tuning constants ────────────────────────────────────────────────
+namespace {
+constexpr int kBlockSize = 256;   // threads per block
+constexpr int kTileSize  = 256;   // shared-memory tile width (== kBlockSize)
+constexpr int kM         = 1024;  // matrix rows
+constexpr int kN         = 2048;  // matrix cols
+}  // namespace
+
+// ── CPU reference (defined in project_template_cpu.cpp) ─────────────
+extern "C" void gemv_reference(float *y, const float *A, const float *x,
+                               int M, int N);
+
+// ── GEMV kernel ─────────────────────────────────────────────────────
+// Each thread computes one element of y:  y[row] = Σ_j A[row][j] * x[j]
+// The x vector is loaded tile-by-tile into shared memory so that every
+// thread in the block can reuse the same cached slice — a textbook
+// pattern for bandwidth-bound kernels.
+__global__ void gemv_kernel(const float * __restrict__ A,
+                            const float * __restrict__ x,
+                            float       * __restrict__ y,
+                            int M, int N)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    __shared__ float xs[kTileSize];
+
+    float sum = 0.0f;
+
+    // Walk through x in tiles of kTileSize
+    for (int tile_start = 0; tile_start < N; tile_start += kTileSize) {
+        // Cooperatively load one tile of x into shared memory
+        const int load_idx = tile_start + threadIdx.x;
+        xs[threadIdx.x] = (load_idx < N) ? x[load_idx] : 0.0f;
+        __syncthreads();
+
+        // Each thread accumulates its dot-product slice
+        if (row < M) {
+            const int tile_end = min(kTileSize, N - tile_start);
+            for (int j = 0; j < tile_end; ++j) {
+                sum += A[row * N + tile_start + j] * xs[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < M) {
+        y[row] = sum;
+    }
+}
+
+// ── Host driver ─────────────────────────────────────────────────────
+int main(int argc, char **argv)
+{
+    printf("[project_template] GEMV (y = A·x)  M=%d  N=%d\n\n", kM, kN);
+
+    const int dev_id = findHggcDevice(argc, (const char **)argv);
+    (void)dev_id;
+
+    // ── Host allocations ────────────────────────────────────────────
+    const size_t bytes_A = sizeof(float) * kM * kN;
+    const size_t bytes_x = sizeof(float) * kN;
+    const size_t bytes_y = sizeof(float) * kM;
+
+    float *h_A   = static_cast<float *>(malloc(bytes_A));
+    float *h_x   = static_cast<float *>(malloc(bytes_x));
+    float *h_y   = static_cast<float *>(malloc(bytes_y));
+    float *h_ref = static_cast<float *>(malloc(bytes_y));
+
+    // Simple deterministic initialisation
+    for (int i = 0; i < kM * kN; ++i) h_A[i] = 1.0f / (1.0f + (i % 128));
+    for (int i = 0; i < kN;      ++i) h_x[i] = static_cast<float>(i % 64);
+
+    // ── Device allocations & H→D copy ───────────────────────────────
+    float *d_A = nullptr, *d_x = nullptr, *d_y = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_A), bytes_A));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_x), bytes_x));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_y), bytes_y));
+
+    checkHggcErrors(hggcMemcpy(d_A, h_A, bytes_A, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_x, h_x, bytes_x, hggcMemcpyHostToDevice));
+
+    // ── Launch kernel ───────────────────────────────────────────────
+    HggcTimer timer;
+    timer.start();
+
+    const dim3 block(kBlockSize);
+    const dim3 grid((kM + kBlockSize - 1) / kBlockSize);
+    gemv_kernel<<<grid, block>>>(d_A, d_x, d_y, kM, kN);
+    getLastHggcError("gemv_kernel launch failed");
+
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    printf("  PPU kernel time : %.3f ms\n", timer.elapsed());
+
+    // ── D→H copy ────────────────────────────────────────────────────
+    checkHggcErrors(hggcMemcpy(h_y, d_y, bytes_y, hggcMemcpyDeviceToHost));
+
+    // ── CPU reference & verify ──────────────────────────────────────
+    gemv_reference(h_ref, h_A, h_x, kM, kN);
+
+    bool pass = true;
+    for (int i = 0; i < kM; ++i) {
+        if (fabsf(h_y[i] - h_ref[i]) > 1e-2f * fabsf(h_ref[i]) + 1e-5f) {
+            printf("  MISMATCH at row %d: device=%.6f  host=%.6f\n",
+                   i, h_y[i], h_ref[i]);
+            pass = false;
+            break;
+        }
+    }
+    printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+
+    // ── Cleanup ─────────────────────────────────────────────────────
+    free(h_A); free(h_x); free(h_y); free(h_ref);
+    checkHggcErrors(hggcFree(d_A));
+    checkHggcErrors(hggcFree(d_x));
+    checkHggcErrors(hggcFree(d_y));
+
+    exit(pass ? EXIT_SUCCESS : EXIT_FAILURE);
+}

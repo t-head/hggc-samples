@@ -1,0 +1,399 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <random>
+
+#include <hggc_runtime.h>
+
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+#ifndef MAX
+#define MAX(a, b) (a > b ? a : b)
+#endif
+
+/* ============================================================
+ *   Common helpers
+ * ============================================================ */
+
+namespace {
+
+constexpr int    kDeviceCap         = 32;
+constexpr int    kReduceSamples     = 1048576 * 32;
+constexpr int    kReduceBlocks      = 32;
+constexpr int    kReduceThreads     = 256;
+constexpr size_t kP2pBufBytes       = 1024 * 1024 * 16 * sizeof(float);
+constexpr int    kP2pPingPongLoops  = 100;
+constexpr int    kP2pVerifyMod      = 4096;
+
+/// Build a deterministic float buffer in [0, 1).
+void fill_uniform(float *dst, int count, std::mt19937 &rng) {
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    for (int i = 0; i < count; ++i) {
+        dst[i] = dist(rng);
+    }
+}
+
+/// Compute an absolute-relative diff guard.
+double rel_error(double reference, double observed) {
+    return std::fabs(reference - observed) / std::fabs(reference);
+}
+
+/// Decide which demo to run from CLI flags.
+enum class CollabMode { kAuto, kMultiDispatch, kP2p };
+
+CollabMode parse_mode(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strncmp(argv[i], "--mode=", 7) == 0) {
+            const char *kind = argv[i] + 7;
+            if (std::strcmp(kind, "multi_dispatch") == 0) return CollabMode::kMultiDispatch;
+            if (std::strcmp(kind, "p2p") == 0)            return CollabMode::kP2p;
+        }
+    }
+    return CollabMode::kAuto;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path A : per-device async dispatch + reduction
+ * ============================================================ */
+
+/// Strided sum reduction; one element written per launched thread.
+__global__ void block_reduce_sum(float *dev_partial, const float *dev_input, int sample_count) {
+    const int slot   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+
+    float local = 0.0f;
+    for (int pos = slot; pos < sample_count; pos += stride) {
+        local += dev_input[pos];
+    }
+    dev_partial[slot] = local;
+}
+
+namespace {
+
+struct DeviceShard {
+    int           sample_count       = 0;
+    float        *host_data          = nullptr;
+    float        *host_partial_back  = nullptr;
+    float        *host_sum_slot      = nullptr;
+    float        *dev_data           = nullptr;
+    float        *dev_partial        = nullptr;
+    hggcStream_t  stream             = nullptr;
+};
+
+int run_multi_dispatch() {
+    int device_count = 0;
+    checkHggcErrors(hggcGetDeviceCount(&device_count));
+    if (device_count > kDeviceCap) device_count = kDeviceCap;
+
+    printf(" -> mode=multi_dispatch | visible devices: %d\n", device_count);
+    if (device_count < 1) {
+        printf("    no HGGC device visible, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+
+    constexpr int accum_per_device = kReduceBlocks * kReduceThreads;
+
+    std::vector<DeviceShard> shards(device_count);
+    std::vector<float>       host_partial_sum(device_count, 0.0f);
+
+    /// Distribute samples (handle the remainder on the first shards).
+    for (int i = 0; i < device_count; ++i) {
+        shards[i].sample_count = kReduceSamples / device_count;
+    }
+    for (int i = 0; i < kReduceSamples % device_count; ++i) {
+        shards[i].sample_count += 1;
+    }
+
+    /// Allocate per-device buffers and seed input data.
+    std::mt19937 rng(20240617u);
+    for (int i = 0; i < device_count; ++i) {
+        checkHggcErrors(hggcSetDevice(i));
+        checkHggcErrors(hggcStreamCreate(&shards[i].stream));
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&shards[i].dev_data),
+                                   shards[i].sample_count * sizeof(float)));
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&shards[i].dev_partial),
+                                   accum_per_device * sizeof(float)));
+        checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&shards[i].host_partial_back),
+                                       accum_per_device * sizeof(float)));
+        checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&shards[i].host_data),
+                                       shards[i].sample_count * sizeof(float)));
+        shards[i].host_sum_slot = host_partial_sum.data() + i;
+        fill_uniform(shards[i].host_data, shards[i].sample_count, rng);
+    }
+
+    /// Launch async H2D + reduce kernel + D2H per device.
+    HggcTimer timer;
+    timer.start();
+
+    for (int i = 0; i < device_count; ++i) {
+        checkHggcErrors(hggcSetDevice(i));
+        checkHggcErrors(hggcMemcpyAsync(shards[i].dev_data,
+                                        shards[i].host_data,
+                                        shards[i].sample_count * sizeof(float),
+                                        hggcMemcpyHostToDevice,
+                                        shards[i].stream));
+        block_reduce_sum<<<kReduceBlocks, kReduceThreads, 0, shards[i].stream>>>(
+            shards[i].dev_partial, shards[i].dev_data, shards[i].sample_count);
+        getLastHggcError("block_reduce_sum() execution failed.\n");
+        checkHggcErrors(hggcMemcpyAsync(shards[i].host_partial_back,
+                                        shards[i].dev_partial,
+                                        accum_per_device * sizeof(float),
+                                        hggcMemcpyDeviceToHost,
+                                        shards[i].stream));
+    }
+
+    /// Drain streams and finalise the reduction on host.
+    for (int i = 0; i < device_count; ++i) {
+        checkHggcErrors(hggcSetDevice(i));
+        hggcStreamSynchronize(shards[i].stream);
+
+        float partial = 0.0f;
+        for (int k = 0; k < accum_per_device; ++k) {
+            partial += shards[i].host_partial_back[k];
+        }
+        *(shards[i].host_sum_slot) = partial;
+
+        checkHggcErrors(hggcFreeHost(shards[i].host_partial_back));
+        checkHggcErrors(hggcFree(shards[i].dev_partial));
+        checkHggcErrors(hggcFree(shards[i].dev_data));
+        checkHggcErrors(hggcStreamDestroy(shards[i].stream));
+    }
+
+    float ppu_total = 0.0f;
+    for (int i = 0; i < device_count; ++i) ppu_total += host_partial_sum[i];
+
+    timer.stop();
+    printf("    PPU reduction time: %f ms\n", timer.elapsed());
+
+    /// Cross-check on host CPU.
+    double cpu_total = 0.0;
+    for (int i = 0; i < device_count; ++i) {
+        for (int k = 0; k < shards[i].sample_count; ++k) {
+            cpu_total += shards[i].host_data[k];
+        }
+    }
+
+    const double diff = rel_error(cpu_total, ppu_total);
+    printf("    PPU sum: %f | CPU sum: %f | rel diff: %E\n",
+           static_cast<double>(ppu_total), cpu_total, diff);
+
+    for (int i = 0; i < device_count; ++i) {
+        checkHggcErrors(hggcSetDevice(i));
+        checkHggcErrors(hggcFreeHost(shards[i].host_data));
+    }
+
+    return (diff < 1e-5) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path B : peer-to-peer copy + cross-device kernel
+ * ============================================================ */
+
+/// Element-wise scale by 2; chosen so two kernel passes yield 4x the input.
+__global__ void scale_x2(const float *src, float *dst) {
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    dst[slot]      = src[slot] * 2.0f;
+}
+
+namespace {
+
+bool host_is_64bit() { return sizeof(void *) == 8; }
+
+/// Find the first ordered pair (a, b) such that a can access b.
+bool pick_p2p_pair(int device_count, int &a, int &b, std::vector<hggcDeviceProp> &props) {
+    a = b = -1;
+    for (int i = 0; i < device_count; ++i) {
+        for (int j = 0; j < device_count; ++j) {
+            if (i == j) continue;
+            int can_peer = 0;
+            checkHggcErrors(hggcDeviceCanAccessPeer(&can_peer, i, j));
+            printf(" > peer access %s (PPU%d) -> %s (PPU%d) : %s\n",
+                   props[i].name, i, props[j].name, j,
+                   can_peer ? "yes" : "no");
+            if (can_peer && a == -1) {
+                a = i;
+                b = j;
+            }
+        }
+    }
+    return a != -1;
+}
+
+int run_p2p() {
+    if (!host_is_64bit()) {
+        printf(" -> mode=p2p | host is not 64-bit, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+
+    int device_count = 0;
+    checkHggcErrors(hggcGetDeviceCount(&device_count));
+    printf(" -> mode=p2p | visible devices: %d\n", device_count);
+    if (device_count < 2) {
+        printf("    need >= 2 peer-capable PPUs, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+
+    std::vector<hggcDeviceProp> props(device_count);
+    for (int i = 0; i < device_count; ++i) {
+        checkHggcErrors(hggcGetDeviceProperties(&props[i], i));
+    }
+
+    int peer_a = -1;
+    int peer_b = -1;
+    if (!pick_p2p_pair(device_count, peer_a, peer_b, props)) {
+        printf("    no peer-capable PPU pair found, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+
+    printf("    enabling peer access between PPU%d and PPU%d\n", peer_a, peer_b);
+    checkHggcErrors(hggcSetDevice(peer_a));
+    checkHggcErrors(hggcDeviceEnablePeerAccess(peer_b, 0));
+    checkHggcErrors(hggcSetDevice(peer_b));
+    checkHggcErrors(hggcDeviceEnablePeerAccess(peer_a, 0));
+
+    /// Allocate one buffer per peer and one pinned host staging buffer.
+    float *dev_peer_a = nullptr;
+    float *dev_peer_b = nullptr;
+    float *host_pin   = nullptr;
+    checkHggcErrors(hggcSetDevice(peer_a));
+    checkHggcErrors(hggcMalloc(&dev_peer_a, kP2pBufBytes));
+    checkHggcErrors(hggcSetDevice(peer_b));
+    checkHggcErrors(hggcMalloc(&dev_peer_b, kP2pBufBytes));
+    checkHggcErrors(hggcMallocHost(&host_pin, kP2pBufBytes));
+
+    /// Bandwidth probe: ping-pong copies between the two peers.
+    hggcEvent_t evt_begin = nullptr;
+    hggcEvent_t evt_end   = nullptr;
+    checkHggcErrors(hggcEventCreateWithFlags(&evt_begin, hggcEventBlockingSync));
+    checkHggcErrors(hggcEventCreateWithFlags(&evt_end,   hggcEventBlockingSync));
+
+    checkHggcErrors(hggcEventRecord(evt_begin, 0));
+    for (int loop = 0; loop < kP2pPingPongLoops; ++loop) {
+        if (loop % 2 == 0) {
+            checkHggcErrors(hggcMemcpy(dev_peer_b, dev_peer_a, kP2pBufBytes, hggcMemcpyDefault));
+        } else {
+            checkHggcErrors(hggcMemcpy(dev_peer_a, dev_peer_b, kP2pBufBytes, hggcMemcpyDefault));
+        }
+    }
+    checkHggcErrors(hggcEventRecord(evt_end, 0));
+    checkHggcErrors(hggcEventSynchronize(evt_end));
+
+    float elapsed_ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&elapsed_ms, evt_begin, evt_end));
+    const double total_bytes = static_cast<double>(kP2pPingPongLoops) * kP2pBufBytes;
+    const double gbps        = (total_bytes / (elapsed_ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
+    printf("    p2p bandwidth PPU%d <-> PPU%d : %.2f GB/s\n", peer_a, peer_b, gbps);
+
+    /// Seed host buffer with a known pattern and ship to peer A.
+    const int element_count = static_cast<int>(kP2pBufBytes / sizeof(float));
+    for (int i = 0; i < element_count; ++i) {
+        host_pin[i] = static_cast<float>(i % kP2pVerifyMod);
+    }
+    checkHggcErrors(hggcSetDevice(peer_a));
+    checkHggcErrors(hggcMemcpy(dev_peer_a, host_pin, kP2pBufBytes, hggcMemcpyDefault));
+
+    /// Two scale-by-2 passes, one per peer; result lives back on peer A.
+    const dim3 block_dim(512, 1);
+    const dim3 grid_dim(element_count / block_dim.x, 1);
+
+    checkHggcErrors(hggcSetDevice(peer_b));
+    scale_x2<<<grid_dim, block_dim>>>(dev_peer_a, dev_peer_b);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    checkHggcErrors(hggcSetDevice(peer_a));
+    scale_x2<<<grid_dim, block_dim>>>(dev_peer_b, dev_peer_a);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /// Verify that each element has been scaled twice.
+    checkHggcErrors(hggcMemcpy(host_pin, dev_peer_a, kP2pBufBytes, hggcMemcpyDefault));
+    int mismatch = 0;
+    for (int i = 0; i < element_count; ++i) {
+        const float ref = static_cast<float>(i % kP2pVerifyMod) * 2.0f * 2.0f;
+        if (host_pin[i] != ref) {
+            printf("    mismatch @ %d: got %f expected %f\n", i, host_pin[i], ref);
+            if (++mismatch > 10) break;
+        }
+    }
+
+    /// Tear down peer access and free buffers.
+    checkHggcErrors(hggcSetDevice(peer_a));
+    checkHggcErrors(hggcDeviceDisablePeerAccess(peer_b));
+    checkHggcErrors(hggcSetDevice(peer_b));
+    checkHggcErrors(hggcDeviceDisablePeerAccess(peer_a));
+
+    checkHggcErrors(hggcEventDestroy(evt_begin));
+    checkHggcErrors(hggcEventDestroy(evt_end));
+    checkHggcErrors(hggcSetDevice(peer_a));
+    checkHggcErrors(hggcFree(dev_peer_a));
+    checkHggcErrors(hggcSetDevice(peer_b));
+    checkHggcErrors(hggcFree(dev_peer_b));
+    checkHggcErrors(hggcFreeHost(host_pin));
+
+    return (mismatch == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+CollabMode resolve_mode(CollabMode requested) {
+    if (requested != CollabMode::kAuto) return requested;
+
+    int device_count = 0;
+    if (hggcGetDeviceCount(&device_count) != hggcSuccess) return CollabMode::kMultiDispatch;
+    if (device_count < 2) return CollabMode::kMultiDispatch;
+
+    /// Probe whether at least one peer-capable pair exists.
+    for (int i = 0; i < device_count; ++i) {
+        for (int j = 0; j < device_count; ++j) {
+            if (i == j) continue;
+            int can_peer = 0;
+            if (hggcDeviceCanAccessPeer(&can_peer, i, j) == hggcSuccess && can_peer) {
+                return CollabMode::kP2p;
+            }
+        }
+    }
+    return CollabMode::kMultiDispatch;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Entry point
+ * ============================================================ */
+
+int main(int argc, char **argv) {
+    printf("[multi_device_collab] starting\n");
+
+    const CollabMode requested = parse_mode(argc, argv);
+    const CollabMode active    = resolve_mode(requested);
+
+    int rc = EXIT_FAILURE;
+    switch (active) {
+        case CollabMode::kP2p:
+            rc = run_p2p();
+            break;
+        case CollabMode::kMultiDispatch:
+        default:
+            rc = run_multi_dispatch();
+            break;
+    }
+
+    if (rc == EXIT_SUCCESS)        printf("[multi_device_collab] passed\n");
+    else if (rc == EXIT_SKIPPED)    printf("[multi_device_collab] waived\n");
+    else                           printf("[multi_device_collab] failed\n");
+
+    return rc;
+}

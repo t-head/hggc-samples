@@ -1,0 +1,299 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+
+#include <cooperative_groups.h>
+#include <hggc/barrier>
+#include <hggc_runtime.h>
+
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+namespace cg = cooperative_groups;
+
+/* ============================================================
+ *   Kernel A : cooperative-groups reduction across a block
+ * ============================================================ */
+
+namespace {
+
+/// Tree-style reduction across an arbitrary cooperative group.
+__device__ int tree_sum(cg::thread_group g, int *scratch, int seed) {
+    int slot = g.thread_rank();
+    for (int span = g.size() / 2; span > 0; span /= 2) {
+        scratch[slot] = seed;
+        g.sync();
+        if (slot < span) {
+            seed += scratch[slot + span];
+        }
+        g.sync();
+    }
+    return (slot == 0) ? seed : -1;
+}
+
+}  /// anonymous
+
+/// Reduce thread ranks at block scope and at tile-of-16 scope.
+__global__ void block_groups_reduction() {
+    cg::thread_block block = cg::this_thread_block();
+    extern __shared__ int scratch[];
+
+    const int block_total = block.size();
+
+    /// Block-wide reduction.
+    int seed     = block.thread_rank();
+    int expected = (block_total - 1) * block_total / 2;
+    int gathered = tree_sum(block, scratch, seed);
+
+    if (block.thread_rank() == 0) {
+        printf(" Sum of all ranks 0..%d in threadBlockGroup is %d (expected %d)\n\n",
+               block_total - 1, gathered, expected);
+        printf(" Now creating %d groups, each of size 16 threads:\n\n",
+               block_total / 16);
+    }
+    block.sync();
+
+    /// Tile-of-16 reduction.
+    cg::thread_block_tile<16> tile = cg::tiled_partition<16>(block);
+    int tile_offset = block.thread_rank() - tile.thread_rank();
+
+    seed     = tile.thread_rank();
+    expected = 15 * 16 / 2;
+    gathered = tree_sum(tile, scratch + tile_offset, seed);
+
+    if (tile.thread_rank() == 0) {
+        printf("   Sum of all ranks 0..15 in this tiledPartition16 group is %d (expected %d)\n",
+               gathered, expected);
+    }
+}
+
+/* ============================================================
+ *   Kernel B : arrive-wait barrier vector normalisation
+ * ============================================================ */
+
+namespace {
+
+/// Reduce per-thread doubles inside a block via warp shuffles + barrier wait.
+template <bool TakeSquareRoot>
+__device__ void awb_block_reduce(hggc::barrier<hggc::thread_scope_block> &gate,
+                                 cg::thread_block_tile<32>               &warp,
+                                 double                                  &local_sum,
+                                 double                                  *result_slot)
+{
+    extern __shared__ double warp_sums[];
+
+#pragma unroll
+    for (int span = warp.size() / 2; span > 0; span /= 2) {
+        local_sum += warp.shfl_down(local_sum, span);
+    }
+    if (warp.thread_rank() == 0) {
+        warp_sums[warp.meta_group_rank()] = local_sum;
+    }
+
+    auto ticket = gate.arrive();
+    gate.wait(std::move(ticket));
+
+    if (warp.meta_group_rank() == 0) {
+        double accum = (warp.thread_rank() < warp.meta_group_size())
+                           ? warp_sums[warp.thread_rank()]
+                           : 0.0;
+#pragma unroll
+        for (int span = warp.size() / 2; span > 0; span /= 2) {
+            accum += warp.shfl_down(accum, span);
+        }
+        if (warp.thread_rank() == 0) {
+            *result_slot = TakeSquareRoot ? sqrt(accum) : accum;
+        }
+    }
+}
+
+}  /// anonymous
+
+__global__ void awb_normalise_dot(float *vec_a, float *vec_b, double *partials, int element_count)
+{
+#pragma diag_suppress static_var_with_dynamic_init
+    cg::thread_block          block = cg::this_thread_block();
+    cg::grid_group            grid  = cg::this_grid();
+    cg::thread_block_tile<32> warp  = cg::tiled_partition<32>(block);
+
+    __shared__ hggc::barrier<hggc::thread_scope_block> gate;
+    if (threadIdx.x == 0) {
+        init(&gate, blockDim.x);
+    }
+    cg::sync(block);
+
+    /// Step 1 : per-block partial dot products.
+    double local_sum = 0.0;
+    for (int i = grid.thread_rank(); i < element_count; i += grid.size()) {
+        local_sum += (double)(vec_a[i] * vec_b[i]);
+    }
+    awb_block_reduce<false>(gate, warp, local_sum, &partials[blockIdx.x]);
+
+    cg::sync(grid);
+
+    /// Step 2 : single block reduces all partials and stores sqrt(total).
+    if (blockIdx.x == 0) {
+        local_sum = 0.0;
+        for (int i = block.thread_rank(); i < gridDim.x; i += block.size()) {
+            local_sum += partials[i];
+        }
+        awb_block_reduce<true>(gate, warp, local_sum, &partials[0]);
+    }
+    cg::sync(grid);
+
+    /// Step 3 : in-place normalisation by the global L2 norm.
+    const double norm = partials[0];
+    for (int i = grid.thread_rank(); i < element_count; i += grid.size()) {
+        vec_a[i] = (float)vec_a[i] / norm;
+        vec_b[i] = (float)vec_b[i] / norm;
+    }
+}
+
+/* ============================================================
+ *   Host dispatch
+ * ============================================================ */
+
+namespace {
+
+/// Run the cooperative-groups reduction demo.
+int run_groups_reduction() {
+    constexpr int blocks_per_grid   = 1;
+    constexpr int threads_per_block = 64;
+    printf("\nLaunching a single block with %d threads...\n\n", threads_per_block);
+
+    block_groups_reduction<<<blocks_per_grid, threads_per_block, threads_per_block * sizeof(int)>>>();
+    hggcError_t status = hggcDeviceSynchronize();
+    if (status != hggcSuccess) {
+        fprintf(stderr, "Failed to launch kernel (error code %s)!\n", hggcGetErrorString(status));
+        return EXIT_FAILURE;
+    }
+    printf("\n...Done.\n\n");
+    return EXIT_SUCCESS;
+}
+
+/// Run the arrive-wait barrier vector-normalisation demo.
+int run_awb_normalise(int dev) {
+    constexpr int element_count = 10000000;
+    constexpr float base_val    = 2.0f;
+
+    float *host_a = nullptr, *host_b = nullptr;
+    float *dev_a  = nullptr, *dev_b  = nullptr;
+    double *dev_partials = nullptr;
+
+    checkHggcErrors(hggcMallocHost(&host_a, sizeof(float) * element_count));
+    checkHggcErrors(hggcMallocHost(&host_b, sizeof(float) * element_count));
+    checkHggcErrors(hggcMalloc(&dev_a, sizeof(float) * element_count));
+    checkHggcErrors(hggcMalloc(&dev_b, sizeof(float) * element_count));
+
+    for (int i = 0; i < element_count; ++i) {
+        host_a[i] = host_b[i] = base_val;
+    }
+
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+    checkHggcErrors(hggcMemcpyAsync(dev_a, host_a, sizeof(float) * element_count,
+                                    hggcMemcpyHostToDevice, stream));
+    checkHggcErrors(hggcMemcpyAsync(dev_b, host_b, sizeof(float) * element_count,
+                                    hggcMemcpyHostToDevice, stream));
+
+    int grid_dim = 0, block_dim = 0;
+    checkHggcErrors(hggcOccupancyMaxPotentialBlockSize(
+        &grid_dim, &block_dim, (void *)awb_normalise_dot, 0, element_count));
+
+    int smem_bytes = ((block_dim / 32) + 1) * sizeof(double);
+    int numBlocksPerUnit = 0;
+    checkHggcErrors(hggcOccupancyMaxActiveBlocksPerMultiprocessor(
+        &numBlocksPerUnit, awb_normalise_dot, block_dim, smem_bytes));
+
+    int multiProcessorCount = 0;
+    checkHggcErrors(hggcDeviceGetAttribute(&multiProcessorCount, hggcDevAttrMultiProcessorCount, dev));
+    grid_dim = multiProcessorCount * numBlocksPerUnit;
+    checkHggcErrors(hggcMalloc(&dev_partials, grid_dim * sizeof(double)));
+
+    printf("Launching awb_normalise_dot kernel with numBlocks = %d blockSize = %d\n",
+           grid_dim, block_dim);
+
+    dim3 grid_shape(grid_dim, 1, 1), block_shape(block_dim, 1, 1);
+    void *kernel_args[] = {(void *)&dev_a, (void *)&dev_b,
+                           (void *)&dev_partials, (void *)&element_count};
+    checkHggcErrors(hggcLaunchCooperativeKernel(
+        (void *)awb_normalise_dot, grid_shape, block_shape, kernel_args, smem_bytes, stream));
+
+    checkHggcErrors(hggcMemcpyAsync(host_a, dev_a, sizeof(float) * element_count,
+                                    hggcMemcpyDeviceToHost, stream));
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    float expected = base_val / sqrtf((float)element_count * base_val * base_val);
+    unsigned int matches = 0;
+    for (int i = 0; i < element_count; ++i) {
+        if (fabsf(host_a[i] - expected) > 0.00001f) {
+            printf("mismatch at i = %d, got %f, expected %f\n", i, host_a[i], expected);
+            break;
+        }
+        ++matches;
+    }
+    printf("Result = %s (%u/%d matched)\n",
+           matches == (unsigned int)element_count ? "PASSED" : "FAILED",
+           matches, element_count);
+
+    checkHggcErrors(hggcFree(dev_a));
+    checkHggcErrors(hggcFree(dev_b));
+    checkHggcErrors(hggcFree(dev_partials));
+    checkHggcErrors(hggcFreeHost(host_a));
+    checkHggcErrors(hggcFreeHost(host_b));
+    checkHggcErrors(hggcStreamDestroy(stream));
+
+    return matches == (unsigned int)element_count ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/// Tiny CLI parser: returns the value of --mode= or default "groups".
+const char *parse_mode(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (strncmp(a, "--mode=", 7) == 0) return a + 7;
+    }
+    return "groups";
+}
+
+}  /// anonymous
+
+int main(int argc, char **argv) {
+    printf("%s starting...\n", argv[0]);
+
+    int dev = findHggcDevice(argc, (const char **)argv);
+
+    const char *mode = parse_mode(argc, argv);
+    int rc = EXIT_SUCCESS;
+
+    if (strcmp(mode, "barrier") == 0) {
+        int major = 0;
+        checkHggcErrors(hggcDeviceGetAttribute(&major, hggcDevAttrComputeCapabilityMajor, dev));
+        if (major < 7) {
+            printf("cooperative_sync barrier mode requires higher device version. Exiting...\n");
+            return EXIT_SKIPPED;
+        }
+        int coop = 0;
+        checkHggcErrors(hggcDeviceGetAttribute(&coop, hggcDevAttrCooperativeLaunch, dev));
+        if (!coop) {
+            printf("\nSelected PPU (%d) does not support Cooperative Kernel Launch, Waiving the run\n", dev);
+            return EXIT_SKIPPED;
+        }
+        rc = run_awb_normalise(dev);
+    } else {
+        rc = run_groups_reduction();
+    }
+
+    printf("%s completed, returned %s\n", argv[0], rc == EXIT_SUCCESS ? "OK" : "ERROR!");
+    return rc;
+}

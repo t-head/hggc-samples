@@ -1,0 +1,133 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * openmp_ppu_dispatch.hg -- Multi-device array scaling via OpenMP
+ *
+ * Each OpenMP thread binds to a PPU device and processes a slice of
+ * a float array with a scale-and-shift kernel: out[i] = in[i] * scale + shift.
+ * Results are verified against a CPU reference.
+ */
+
+#include <helper_hggc.h>
+#include <omp.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+namespace {
+
+constexpr float kScale     = 2.5f;
+constexpr float kShift     = 10.0f;
+constexpr int   kThreads   = 128;
+constexpr int   kPerDevice = 8192;
+
+/* CPU reference: y = x * scale + shift */
+void cpu_reference(const float *src, float *dst, int n, float scale, float shift)
+{
+    for (int i = 0; i < n; i++)
+        dst[i] = src[i] * scale + shift;
+}
+
+/* Verify device results against CPU reference */
+bool verify_result(const float *result, const float *reference, int n, float tol)
+{
+    for (int i = 0; i < n; i++) {
+        float diff = result[i] - reference[i];
+        if (diff < 0) diff = -diff;
+        if (diff > tol) {
+            printf("  MISMATCH at [%d]: got %.4f, expected %.4f (diff %.6e)\n",
+                   i, result[i], reference[i], diff);
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+/* ── Device kernel: scale and shift ─────────────────────────── */
+
+__global__ void scale_shift_kernel(float *data, int n, float scale, float shift)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        data[idx] = data[idx] * scale + shift;
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char *argv[])
+{
+    printf("[openmp_ppu_dispatch] Multi-Device Array Scaling via OpenMP\n\n");
+
+    int num_devices = 0;
+    checkHggcErrors(hggcGetDeviceCount(&num_devices));
+    if (num_devices < 1) {
+        printf("  No HGGC-capable devices found.\n");
+        return EXIT_FAILURE;
+    }
+
+    printf("  Host CPUs:    %d\n", omp_get_num_procs());
+    printf("  PPU devices:  %d\n", num_devices);
+    for (int i = 0; i < num_devices; i++) {
+        hggcDeviceProp props;
+        checkHggcErrors(hggcGetDeviceProperties(&props, i));
+        printf("    Device %d: %s\n", i, props.name);
+    }
+    printf("  Kernel: out[i] = in[i] * %.2f + %.2f\n\n", kScale, kShift);
+
+    const int total = num_devices * kPerDevice;
+    std::vector<float> host_data(total);
+    std::vector<float> host_ref(total);
+
+    /* Generate input: sinusoidal pattern */
+    for (int i = 0; i < total; i++)
+        host_data[i] = sinf(static_cast<float>(i) * 0.1f);
+
+    /* CPU reference */
+    cpu_reference(host_data.data(), host_ref.data(), total, kScale, kShift);
+
+    /* OpenMP parallel dispatch: one thread per device */
+    omp_set_num_threads(num_devices);
+
+#pragma omp parallel
+    {
+        int tid       = omp_get_thread_num();
+        int nthreads  = omp_get_num_threads();
+        int slice_len = total / nthreads;
+        size_t bytes  = slice_len * sizeof(float);
+
+        checkHggcErrors(hggcSetDevice(tid % num_devices));
+        int dev_id = -1;
+        checkHggcErrors(hggcGetDevice(&dev_id));
+
+        printf("  Thread %d/%d → PPU %d (slice: %d elements)\n",
+               tid, nthreads, dev_id, slice_len);
+
+        float *d_buf = nullptr;
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_buf), bytes));
+
+        float *h_slice = host_data.data() + tid * slice_len;
+        checkHggcErrors(hggcMemcpy(d_buf, h_slice, bytes, hggcMemcpyHostToDevice));
+
+        int grid = (slice_len + kThreads - 1) / kThreads;
+        scale_shift_kernel<<<grid, kThreads>>>(d_buf, slice_len, kScale, kShift);
+
+        checkHggcErrors(hggcMemcpy(h_slice, d_buf, bytes, hggcMemcpyDeviceToHost));
+        checkHggcErrors(hggcFree(d_buf));
+    }
+
+    /* Verify */
+    printf("\n  Verifying against CPU reference...\n");
+    bool ok = verify_result(host_data.data(), host_ref.data(), total, 1e-4f);
+    printf("  Result: %s\n", ok ? "PASS" : "FAIL");
+
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

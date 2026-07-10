@@ -1,0 +1,151 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * thrust_pipeline — Thrust Data-Parallel Algorithm Showcase
+ *
+ * Demonstrates a practical data-processing pipeline using multiple Thrust
+ * primitives, each timed independently:
+ *   1. generate  — fill device vector with pseudo-random data
+ *   2. sort      — radix sort (the classic Thrust strength)
+ *   3. unique    — remove consecutive duplicates after sort
+ *   4. transform — apply a unary functor (square each element)
+ *   5. reduce    — compute the sum of all elements
+ *   6. inclusive_scan — prefix sum
+ *
+ * This showcases Thrust as a composable toolkit rather than a single sort.
+ */
+#include <cstdio>
+#include <cstdlib>
+
+#include <thrust/copy.h>
+#include <thrust/device_vector.h>
+#include <thrust/functional.h>
+#include <thrust/generate.h>
+#include <thrust/host_vector.h>
+#include <thrust/random.h>
+#include <thrust/reduce.h>
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+
+constexpr int N = 1 << 20;  // 1M elements
+
+struct square_op {
+    __host__ __device__ unsigned int operator()(unsigned int x) const
+    {
+        return x * x;
+    }
+};
+
+/// Measure elapsed time between two events in milliseconds.
+float event_elapsed_ms(hggcEvent_t start, hggcEvent_t stop)
+{
+    float ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&ms, start, stop));
+    return ms;
+}
+
+}  // namespace
+
+int main(int argc, char **argv)
+{
+    printf("[thrust_pipeline] Data-Parallel Algorithm Showcase\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    hggcEvent_t ev_start, ev_stop;
+    checkHggcErrors(hggcEventCreate(&ev_start));
+    checkHggcErrors(hggcEventCreate(&ev_stop));
+
+    // ---- Step 1: Generate random data ----
+    thrust::host_vector<unsigned int> h_data(N);
+    thrust::default_random_engine rng(42);
+    thrust::uniform_int_distribution<unsigned int> dist(0, 9999);
+    for (int i = 0; i < N; ++i) h_data[i] = dist(rng);
+
+    thrust::device_vector<unsigned int> d_data = h_data;
+    printf("  Input: %d elements in [0, 9999]\n\n", N);
+
+    // ---- Step 2: Sort ----
+    checkHggcErrors(hggcEventRecord(ev_start, 0));
+    thrust::sort(d_data.begin(), d_data.end());
+    checkHggcErrors(hggcEventRecord(ev_stop, 0));
+    checkHggcErrors(hggcEventSynchronize(ev_stop));
+    printf("  sort            : %7.3f ms  (%d elements)\n",
+           event_elapsed_ms(ev_start, ev_stop), N);
+
+    // Validate sort.
+    thrust::host_vector<unsigned int> h_sorted = d_data;
+    bool sort_ok = true;
+    for (int i = 1; i < N && sort_ok; ++i) {
+        if (h_sorted[i - 1] > h_sorted[i]) sort_ok = false;
+    }
+
+    // ---- Step 3: Unique (remove duplicates) ----
+    checkHggcErrors(hggcEventRecord(ev_start, 0));
+    auto new_end = thrust::unique(d_data.begin(), d_data.end());
+    checkHggcErrors(hggcEventRecord(ev_stop, 0));
+    checkHggcErrors(hggcEventSynchronize(ev_stop));
+    int unique_count = static_cast<int>(new_end - d_data.begin());
+    printf("  unique          : %7.3f ms  (%d -> %d unique)\n",
+           event_elapsed_ms(ev_start, ev_stop), N, unique_count);
+
+    // Resize to unique range for subsequent operations.
+    d_data.resize(unique_count);
+
+    // ---- Step 4: Transform (square each element) ----
+    thrust::device_vector<unsigned int> d_squared(unique_count);
+    checkHggcErrors(hggcEventRecord(ev_start, 0));
+    thrust::transform(d_data.begin(), d_data.end(), d_squared.begin(), square_op());
+    checkHggcErrors(hggcEventRecord(ev_stop, 0));
+    checkHggcErrors(hggcEventSynchronize(ev_stop));
+    printf("  transform (x^2) : %7.3f ms  (%d elements)\n",
+           event_elapsed_ms(ev_start, ev_stop), unique_count);
+
+    // ---- Step 5: Reduce (sum of squares) ----
+    checkHggcErrors(hggcEventRecord(ev_start, 0));
+    unsigned long long sum = thrust::reduce(
+        d_squared.begin(), d_squared.end(), 0ULL, thrust::plus<unsigned long long>());
+    checkHggcErrors(hggcEventRecord(ev_stop, 0));
+    checkHggcErrors(hggcEventSynchronize(ev_stop));
+    printf("  reduce (sum)    : %7.3f ms  (result = %llu)\n",
+           event_elapsed_ms(ev_start, ev_stop), sum);
+
+    // ---- Step 6: Inclusive scan (prefix sum) ----
+    thrust::device_vector<unsigned int> d_scan(unique_count);
+    checkHggcErrors(hggcEventRecord(ev_start, 0));
+    thrust::inclusive_scan(d_data.begin(), d_data.end(), d_scan.begin());
+    checkHggcErrors(hggcEventRecord(ev_stop, 0));
+    checkHggcErrors(hggcEventSynchronize(ev_stop));
+    printf("  inclusive_scan  : %7.3f ms  (%d elements)\n",
+           event_elapsed_ms(ev_start, ev_stop), unique_count);
+
+    // Validate scan: last element should equal reduce of original.
+    unsigned int scan_total = d_scan.back();
+    unsigned int reduce_check = thrust::reduce(d_data.begin(), d_data.end(), 0u);
+    bool scan_ok = (scan_total == reduce_check);
+
+    // ---- Summary ----
+    checkHggcErrors(hggcEventDestroy(ev_start));
+    checkHggcErrors(hggcEventDestroy(ev_stop));
+
+    printf("\n  Validation:\n");
+    printf("    sort      : %s\n", sort_ok ? "PASS" : "FAIL");
+    printf("    scan      : %s\n", scan_ok ? "PASS" : "FAIL");
+
+    bool pass = sort_ok && scan_ok;
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

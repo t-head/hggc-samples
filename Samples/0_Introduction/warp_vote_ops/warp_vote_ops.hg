@@ -1,0 +1,211 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <assert.h>
+#include <stdio.h>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+#include "warp_vote_kernels.hgh"
+
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
+namespace {
+constexpr int kVoteGroups        = 4;
+constexpr int kDefaultWarpSize   = 32;
+const char *const kSampleTag     = "[warp_vote_ops]";
+}  // namespace
+
+/// Build a 4-region predicate pattern:
+///   region 0: all zeros           — ANY → 0
+///   region 1: half non-zero       — ANY → 1
+///   region 2: half non-zero       — ALL → 0
+///   region 3: all 0xffffffff      — ALL → 1
+static void build_predicate_pattern(unsigned int *pattern, int size)
+{
+    for (int i = 0; i < size / 4; ++i) {
+        pattern[i] = 0x00000000u;
+    }
+    for (int i = 2 * size / 8; i < 4 * size / 8; ++i) {
+        pattern[i] = (i & 0x01) ? static_cast<unsigned int>(i) : 0u;
+    }
+    for (int i = 2 * size / 4; i < 3 * size / 4; ++i) {
+        pattern[i] = (i & 0x01) ? 0u : static_cast<unsigned int>(i);
+    }
+    for (int i = 3 * size / 4; i < 4 * size / 4; ++i) {
+        pattern[i] = 0xffffffffu;
+    }
+}
+
+/// Expect every entry within [start,end) to be zero.
+static int expect_zero_block(unsigned int *host_result, int start, int end, const char *tag)
+{
+    int sum = 0;
+    for (int i = start; i < end; ++i) {
+        sum += host_result[i];
+    }
+    if (sum > 0) {
+        printf("\t<%s>[%d - %d] = ", tag, start, end - 1);
+        for (int i = start; i < end; ++i) {
+            printf("%d", host_result[i]);
+        }
+        printf("%d values FAILED\n", sum);
+    }
+    return (sum > 0) ? 1 : 0;
+}
+
+/// Expect the sum within [start,end) to equal one warp width.
+static int expect_warp_set_block(unsigned int *host_result, int start, int end, int warp_size, const char *tag)
+{
+    int sum = 0;
+    for (int i = start; i < end; ++i) {
+        sum += host_result[i];
+    }
+    if (sum != warp_size) {
+        printf("\t<%s>[%d - %d] = ", tag, start, end - 1);
+        for (int i = start; i < end; ++i) {
+            printf("%d", host_result[i]);
+        }
+        printf(" - FAILED\n");
+    }
+    return (sum != warp_size) ? 1 : 0;
+}
+
+static int verify_any_kernel(unsigned int *host_result, int /*size*/, int warp_size)
+{
+    int errors = 0;
+    const int q = kVoteGroups * warp_size / 4;
+    errors += expect_zero_block      (host_result,     0,     q,           "Vote.Any");
+    errors += expect_warp_set_block  (host_result,     q, 2 * q, warp_size, "Vote.Any");
+    errors += expect_warp_set_block  (host_result, 2 * q, 3 * q, warp_size, "Vote.Any");
+    errors += expect_warp_set_block  (host_result, 3 * q, 4 * q, warp_size, "Vote.Any");
+    printf((errors == 0) ? "\tOK\n" : "\tERROR\n");
+    return errors;
+}
+
+static int verify_all_kernel(unsigned int *host_result, int /*size*/, int warp_size)
+{
+    int errors = 0;
+    const int q = kVoteGroups * warp_size / 4;
+    errors += expect_zero_block      (host_result,     0,     q,           "Vote.All");
+    errors += expect_zero_block      (host_result,     q, 2 * q,           "Vote.All");
+    errors += expect_zero_block      (host_result, 2 * q, 3 * q,           "Vote.All");
+    errors += expect_warp_set_block  (host_result, 3 * q, 4 * q, warp_size, "Vote.All");
+    printf((errors == 0) ? "\tOK\n" : "\tERROR\n");
+    return errors;
+}
+
+static int verify_mixed_kernel(bool *host_info, int size)
+{
+    int errors = 0;
+    for (int i = 0; i < size * 3; ++i) {
+        switch (i % 3) {
+        case 0:
+            if (host_info[i] != (i >= size * 1)) {
+                ++errors;
+            }
+            break;
+        case 1:
+            if (host_info[i] != (i >= size * 3 / 2)) {
+                ++errors;
+            }
+            break;
+        case 2:
+            if (host_info[i] != (i >= size * 2)) {
+                ++errors;
+            }
+            break;
+        }
+    }
+    printf((errors == 0) ? "\tOK\n" : "\tERROR\n");
+    return errors;
+}
+
+int main(int argc, char **argv)
+{
+    printf("%s\n", kSampleTag);
+
+    const int dev_id = findHggcDevice(argc, (const char **)argv);
+
+    hggcDeviceProp dev_props;
+    checkHggcErrors(hggcGetDeviceProperties(&dev_props, dev_id));
+    printf("> PPU device has %d compute units\n\n", dev_props.multiProcessorCount);
+
+    const int warp_size  = kDefaultWarpSize;
+    const int byte_count = kVoteGroups * warp_size * static_cast<int>(sizeof(unsigned int));
+
+    unsigned int *host_input  = static_cast<unsigned int *>(malloc(byte_count));
+    unsigned int *host_result = static_cast<unsigned int *>(malloc(byte_count));
+    unsigned int *dev_input   = nullptr;
+    unsigned int *dev_result  = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_input),  byte_count));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_result), byte_count));
+
+    build_predicate_pattern(host_input, kVoteGroups * warp_size);
+    checkHggcErrors(hggcMemcpy(dev_input, host_input, byte_count, hggcMemcpyHostToDevice));
+
+    int errors[3] = {0, 0, 0};
+
+    printf("[VOTE Kernel Test 1/3]\n");
+    printf("\tRunning <<Vote.Any>> any_vote_kernel ...\n");
+    {
+        checkHggcErrors(hggcDeviceSynchronize());
+        dim3 grid_dim(1, 1);
+        dim3 block_dim(kVoteGroups * warp_size, 1);
+        any_vote_kernel<<<grid_dim, block_dim>>>(dev_input, dev_result, kVoteGroups * warp_size);
+        getLastHggcError("any_vote_kernel() execution failed\n");
+        checkHggcErrors(hggcDeviceSynchronize());
+    }
+    checkHggcErrors(hggcMemcpy(host_result, dev_result, byte_count, hggcMemcpyDeviceToHost));
+    errors[0] += verify_any_kernel(host_result, kVoteGroups * warp_size, warp_size);
+
+    printf("\n[VOTE Kernel Test 2/3]\n");
+    printf("\tRunning <<Vote.All>> all_vote_kernel ...\n");
+    {
+        checkHggcErrors(hggcDeviceSynchronize());
+        dim3 grid_dim(1, 1);
+        dim3 block_dim(kVoteGroups * warp_size, 1);
+        all_vote_kernel<<<grid_dim, block_dim>>>(dev_input, dev_result, kVoteGroups * warp_size);
+        getLastHggcError("all_vote_kernel() execution failed\n");
+        checkHggcErrors(hggcDeviceSynchronize());
+    }
+    checkHggcErrors(hggcMemcpy(host_result, dev_result, byte_count, hggcMemcpyDeviceToHost));
+    errors[1] += verify_all_kernel(host_result, kVoteGroups * warp_size, warp_size);
+
+    bool *host_info = static_cast<bool *>(calloc(warp_size * 3 * 3, sizeof(bool)));
+    bool *dev_info  = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_info), warp_size * 3 * 3 * sizeof(bool)));
+    checkHggcErrors(hggcMemcpy(dev_info, host_info, warp_size * 3 * 3 * sizeof(bool), hggcMemcpyHostToDevice));
+
+    printf("\n[VOTE Kernel Test 3/3]\n");
+    printf("\tRunning <<Vote.Any>> mixed_vote_kernel ...\n");
+    {
+        checkHggcErrors(hggcDeviceSynchronize());
+        mixed_vote_kernel<<<1, warp_size * 3>>>(dev_info, warp_size);
+        checkHggcErrors(hggcDeviceSynchronize());
+    }
+    checkHggcErrors(hggcMemcpy(host_info, dev_info, warp_size * 3 * 3 * sizeof(bool), hggcMemcpyDeviceToHost));
+    errors[2] = verify_mixed_kernel(host_info, warp_size * 3);
+
+    checkHggcErrors(hggcFree(dev_input));
+    checkHggcErrors(hggcFree(dev_result));
+    free(host_input);
+    free(host_result);
+
+    free(host_info);
+    checkHggcErrors(hggcFree(dev_info));
+
+    printf("\tShutting down...\n");
+
+    return (errors[0] == 0 && errors[1] == 0 && errors[2] == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

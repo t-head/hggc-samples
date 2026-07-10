@@ -1,0 +1,139 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * histogram.hg — Three progressively optimized 256-bin histogram kernels
+ *
+ * Strategy 1 (Naive):         Global atomicAdd per byte  —  simple but slow
+ * Strategy 2 (Shared-mem):    Per-block private histogram in shared memory,
+ *                             then atomicAdd to global  —  much less contention
+ * Strategy 3 (Warp-private):  Per-warp sub-histograms reduce shared-mem
+ *                             atomic contention further  —  best throughput
+ */
+#include <cstdint>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+
+#include "histogram_common.h"
+
+constexpr int WARP_SIZE = 32;
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 1: Global atomicAdd (baseline)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void hist_global_kernel(uint32_t *hist, const uint8_t *data, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    for (int i = idx; i < n; i += stride) {
+        atomicAdd(&hist[data[i]], 1u);
+    }
+}
+
+void histogram_global_atomic(uint32_t *d_hist, const uint8_t *d_data, int n)
+{
+    checkHggcErrors(hggcMemset(d_hist, 0, NUM_BINS * sizeof(uint32_t)));
+    int grid = (n + kBlockSize - 1) / kBlockSize;
+    if (grid > 1024) grid = 1024;  // cap grid to avoid excessive scheduling overhead
+    hist_global_kernel<<<grid, kBlockSize>>>(d_hist, d_data, n);
+    getLastHggcError("hist_global_kernel failed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 2: Per-block shared-memory privatization
+// ═══════════════════════════════════════════════════════════════════════
+// Each block accumulates into a private 256-bin histogram in shared memory,
+// then atomically merges into the global histogram.
+
+__global__ void hist_shared_kernel(uint32_t *hist, const uint8_t *data, int n)
+{
+    __shared__ uint32_t s_hist[NUM_BINS];
+
+    // Cooperatively zero shared histogram.
+    for (int i = threadIdx.x; i < NUM_BINS; i += blockDim.x) {
+        s_hist[i] = 0;
+    }
+    __syncthreads();
+
+    // Accumulate into shared-memory histogram.
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int i = idx; i < n; i += stride) {
+        atomicAdd(&s_hist[data[i]], 1u);
+    }
+    __syncthreads();
+
+    // Merge shared histogram into global.
+    for (int i = threadIdx.x; i < NUM_BINS; i += blockDim.x) {
+        if (s_hist[i] > 0) {
+            atomicAdd(&hist[i], s_hist[i]);
+        }
+    }
+}
+
+void histogram_shared_private(uint32_t *d_hist, const uint8_t *d_data, int n)
+{
+    checkHggcErrors(hggcMemset(d_hist, 0, NUM_BINS * sizeof(uint32_t)));
+    int grid = (n + kBlockSize - 1) / kBlockSize;
+    if (grid > 1024) grid = 1024;
+    hist_shared_kernel<<<grid, kBlockSize>>>(d_hist, d_data, n);
+    getLastHggcError("hist_shared_kernel failed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strategy 3: Per-warp sub-histograms (lowest contention)
+// ═══════════════════════════════════════════════════════════════════════
+// Each warp gets its own 256-bin sub-histogram in shared memory, so
+// atomicAdd within a warp never conflicts with other warps.
+// After accumulation, sub-histograms are merged block-wide.
+
+constexpr int WARPS_PER_BLOCK = kBlockSize / WARP_SIZE;
+
+__global__ void hist_warp_kernel(uint32_t *hist, const uint8_t *data, int n)
+{
+    __shared__ uint32_t s_hist[WARPS_PER_BLOCK][NUM_BINS];
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+
+    // Zero this warp's sub-histogram.
+    for (int i = threadIdx.x % WARP_SIZE; i < NUM_BINS; i += WARP_SIZE) {
+        s_hist[warp_id][i] = 0;
+    }
+    __syncthreads();
+
+    // Accumulate into per-warp sub-histogram.
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int i = idx; i < n; i += stride) {
+        atomicAdd(&s_hist[warp_id][data[i]], 1u);
+    }
+    __syncthreads();
+
+    // Merge all warp sub-histograms into global.
+    for (int bin = threadIdx.x; bin < NUM_BINS; bin += blockDim.x) {
+        uint32_t sum = 0;
+        for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+            sum += s_hist[w][bin];
+        }
+        if (sum > 0) {
+            atomicAdd(&hist[bin], sum);
+        }
+    }
+}
+
+void histogram_warp_private(uint32_t *d_hist, const uint8_t *d_data, int n)
+{
+    checkHggcErrors(hggcMemset(d_hist, 0, NUM_BINS * sizeof(uint32_t)));
+    int grid = (n + kBlockSize - 1) / kBlockSize;
+    if (grid > 512) grid = 512;  // fewer blocks since more smem per block
+    hist_warp_kernel<<<grid, kBlockSize>>>(d_hist, d_data, n);
+    getLastHggcError("hist_warp_kernel failed");
+}

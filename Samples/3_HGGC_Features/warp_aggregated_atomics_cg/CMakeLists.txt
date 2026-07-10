@@ -1,0 +1,2 @@
+add_executable(warp_aggregated_atomics_cg warp_aggregated_atomics_cg.hg)
+target_include_directories(warp_aggregated_atomics_cg PRIVATE ${COMMON_DIR})

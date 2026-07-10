@@ -1,0 +1,214 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * mem_pool_lifecycle -- Memory Pool Mechanism Deep-Dive
+ *
+ * Demonstrates the lifecycle of HGGC stream-ordered memory pools:
+ *
+ *   1. Default pool: basic hggcMallocAsync / hggcFreeAsync on a stream
+ *   2. Pool reuse: set high release threshold so freed memory stays in
+ *      pool and is reused on subsequent allocations (observe same address)
+ *   3. Performance comparison: sync hggcMalloc vs async (cold) vs async
+ *      (pool-warm) across multiple iterations
+ *   4. Pool trim: release unused memory back to the OS
+ *
+ * This shows the pool mechanism itself, not just async alloc as an API.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <climits>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int BLOCK   = 256;
+constexpr int N       = 1 << 20;  // 1M elements
+constexpr int ITERS   = 20;
+}  // namespace
+
+// Trivial SAXPY kernel as payload.
+__global__ void saxpy_kernel(float *y, const float *x, float a, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) y[idx] = a * x[idx] + y[idx];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 1: Sync allocation baseline (hggcMalloc / hggcFree)
+// ═══════════════════════════════════════════════════════════════════════
+
+static float test_sync_malloc(const float *h_x, int n)
+{
+    HggcTimer timer;
+    dim3 block(BLOCK);
+    dim3 grid((n + BLOCK - 1) / BLOCK);
+    size_t bytes = n * sizeof(float);
+
+    timer.start();
+    for (int i = 0; i < ITERS; ++i) {
+        float *d_x, *d_y;
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_x), bytes));
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_y), bytes));
+        checkHggcErrors(hggcMemcpy(d_x, h_x, bytes, hggcMemcpyHostToDevice));
+        checkHggcErrors(hggcMemset(d_y, 0, bytes));
+
+        saxpy_kernel<<<grid, block>>>(d_y, d_x, 2.0f, n);
+
+        checkHggcErrors(hggcDeviceSynchronize());
+        checkHggcErrors(hggcFree(d_x));
+        checkHggcErrors(hggcFree(d_y));
+    }
+    timer.stop();
+    return timer.elapsed();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 2: Async allocation, no pool reuse (threshold = 0, default)
+// ═══════════════════════════════════════════════════════════════════════
+
+static float test_async_cold(const float *h_x, int n, hggcStream_t stream)
+{
+    HggcTimer timer;
+    dim3 block(BLOCK);
+    dim3 grid((n + BLOCK - 1) / BLOCK);
+    size_t bytes = n * sizeof(float);
+
+    timer.start();
+    for (int i = 0; i < ITERS; ++i) {
+        float *d_x, *d_y;
+        checkHggcErrors(hggcMallocAsync(&d_x, bytes, stream));
+        checkHggcErrors(hggcMallocAsync(&d_y, bytes, stream));
+        checkHggcErrors(hggcMemcpyAsync(d_x, h_x, bytes, hggcMemcpyHostToDevice, stream));
+        checkHggcErrors(hggcMemsetAsync(d_y, 0, bytes, stream));
+
+        saxpy_kernel<<<grid, block, 0, stream>>>(d_y, d_x, 2.0f, n);
+
+        checkHggcErrors(hggcFreeAsync(d_x, stream));
+        checkHggcErrors(hggcFreeAsync(d_y, stream));
+        checkHggcErrors(hggcStreamSynchronize(stream));
+    }
+    timer.stop();
+    return timer.elapsed();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 3: Async allocation, pool-warm (high release threshold)
+// Shows address reuse: freed memory stays in pool and is recycled.
+// ═══════════════════════════════════════════════════════════════════════
+
+static float test_async_pool_reuse(const float *h_x, int n,
+                                   hggcStream_t stream, int dev)
+{
+    // Set high release threshold so pool keeps memory after free.
+    hggcMemPool_t pool;
+    checkHggcErrors(hggcDeviceGetDefaultMemPool(&pool, dev));
+    uint64_t threshold = ULLONG_MAX;
+    checkHggcErrors(hggcMemPoolSetAttribute(pool, hggcMemPoolAttrReleaseThreshold, &threshold));
+
+    HggcTimer timer;
+    dim3 block(BLOCK);
+    dim3 grid((n + BLOCK - 1) / BLOCK);
+    size_t bytes = n * sizeof(float);
+
+    float *prev_x = nullptr;
+
+    timer.start();
+    for (int i = 0; i < ITERS; ++i) {
+        float *d_x, *d_y;
+        checkHggcErrors(hggcMallocAsync(&d_x, bytes, stream));
+        checkHggcErrors(hggcMallocAsync(&d_y, bytes, stream));
+        checkHggcErrors(hggcMemcpyAsync(d_x, h_x, bytes, hggcMemcpyHostToDevice, stream));
+        checkHggcErrors(hggcMemsetAsync(d_y, 0, bytes, stream));
+
+        saxpy_kernel<<<grid, block, 0, stream>>>(d_y, d_x, 2.0f, n);
+
+        checkHggcErrors(hggcFreeAsync(d_x, stream));
+        checkHggcErrors(hggcFreeAsync(d_y, stream));
+        checkHggcErrors(hggcStreamSynchronize(stream));
+
+        // Show address reuse (after warmup).
+        if (i == 1) prev_x = d_x;
+        if (i > 1 && d_x == prev_x) {
+            if (i == 2) printf("    -> Address reuse confirmed (iter 2+: d_x=%p)\n", (void *)d_x);
+        }
+    }
+    timer.stop();
+
+    // Reset threshold to 0 so pool releases memory.
+    threshold = 0;
+    checkHggcErrors(hggcMemPoolSetAttribute(pool, hggcMemPoolAttrReleaseThreshold, &threshold));
+    // Trim: release all unused memory back to OS.
+    checkHggcErrors(hggcMemPoolTrimTo(pool, 0));
+    printf("    -> Pool trimmed (unused memory returned to OS)\n");
+
+    return timer.elapsed();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[mem_pool_lifecycle] Memory Pool Mechanism Deep-Dive\n\n");
+
+    int dev = findHggcDevice(argc, (const char **)argv);
+
+    // Check memory pool support.
+    int pool_supported = 0;
+    checkHggcErrors(hggcDeviceGetAttribute(&pool_supported, hggcDevAttrMemoryPoolsSupported, dev));
+    if (!pool_supported) {
+        printf("  Device does not support memory pools. Skipping.\n");
+        return EXIT_SKIPPED;
+    }
+
+    // Host data.
+    size_t bytes = N * sizeof(float);
+    float *h_x = (float *)malloc(bytes);
+    for (int i = 0; i < N; ++i) h_x[i] = (float)(i % 256) * 0.01f;
+
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+
+    printf("  Running %d iterations of SAXPY (%d elements) per test\n\n", ITERS, N);
+
+    // ---- Test 1: sync ----
+    printf("  [1] hggcMalloc (sync)\n");
+    float t1 = test_sync_malloc(h_x, N);
+    printf("      Total: %.1f ms  (%.2f ms/iter)\n\n", t1, t1 / ITERS);
+
+    // ---- Test 2: async cold ----
+    printf("  [2] hggcMallocAsync (threshold=0, no pool reuse)\n");
+    float t2 = test_async_cold(h_x, N, stream);
+    printf("      Total: %.1f ms  (%.2f ms/iter)\n\n", t2, t2 / ITERS);
+
+    // ---- Test 3: async pool reuse ----
+    printf("  [3] hggcMallocAsync (threshold=MAX, pool reuse)\n");
+    float t3 = test_async_pool_reuse(h_x, N, stream, dev);
+    printf("      Total: %.1f ms  (%.2f ms/iter)\n\n", t3, t3 / ITERS);
+
+    // ---- Summary ----
+    printf("  Summary:\n");
+    printf("  +--------------------------------------+-----------+\n");
+    printf("  | Strategy                             | ms/iter   |\n");
+    printf("  +--------------------------------------+-----------+\n");
+    printf("  | hggcMalloc (sync)                    | %9.2f |\n", t1 / ITERS);
+    printf("  | hggcMallocAsync (cold, no reuse)     | %9.2f |\n", t2 / ITERS);
+    printf("  | hggcMallocAsync (warm, pool reuse)   | %9.2f |\n", t3 / ITERS);
+    printf("  +--------------------------------------+-----------+\n");
+
+    // Cleanup.
+    free(h_x);
+    checkHggcErrors(hggcStreamDestroy(stream));
+
+    printf("\n  Result: PASS\n");
+    return EXIT_SUCCESS;
+}

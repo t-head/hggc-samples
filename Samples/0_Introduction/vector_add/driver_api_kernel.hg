@@ -1,0 +1,17 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+extern "C" __global__ void weighted_sum_kernel(
+    const float *x, const float *y, float *out,
+    int n, float alpha, float beta, float gamma)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        out[idx] = alpha * x[idx] + beta * y[idx] + gamma;
+}

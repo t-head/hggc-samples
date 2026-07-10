@@ -1,0 +1,279 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * aiu_gemm -- FP16 GEMM via AIU .swzl Bulk Tensor Copy
+ *
+ * Simplified pre-tiling: only retile stride (K→64 for A, N→64 for B).
+ * Uses dim_h > cube_h with start_h to select sub-tiles from large tensors.
+ *
+ *   - A: (M×64) tensor per K-group, dim_h=M, cube_h=16, start_h=tile_row*16
+ *   - B: (64×64) tensor per (kg,ng), dim_h=64, cube_h=16, start_h=kt*16
+ *   - AIU .swzl + ldmatrix.swzl for both A and B
+ *   - B stored row-major, m16n16.x1.trans → column-major for MMA .col
+ *   - MMA: ppu.tc01.mma.m16n16k16.row.col.f32.f16.f16.f32 (fp16 inputs, fp32 accumulate)
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include "hggc_fp16.h"
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+
+constexpr int M_GLOBAL = 256;
+constexpr int N_GLOBAL = 256;
+constexpr int K_GLOBAL = 256;
+
+constexpr int TILE_M = 16;
+constexpr int TILE_N = 16;
+constexpr int TILE_K = 16;
+
+constexpr int K_GROUP    = 64;
+constexpr int N_GROUP    = 64;
+constexpr int N_K_GROUPS = K_GLOBAL / K_GROUP;
+constexpr int N_N_GROUPS = N_GLOBAL / N_GROUP;
+
+constexpr int WARP_SIZE  = 32;
+constexpr int kBlockSize = 32;
+
+constexpr int TILE_ELEM  = TILE_M * K_GROUP;
+
+}  // namespace
+
+__global__ void aiu_gemm_kernel(
+    const __half * __restrict__ A_retiled,
+    const __half * __restrict__ B_retiled,
+    float        * __restrict__ D,
+    int N, int K)
+{
+    const int tile_row = blockIdx.y;
+    const int ng = blockIdx.x;
+    const int lane = threadIdx.x;
+
+    __shared__ __align__(128) __half smem_a[TILE_ELEM];
+    __shared__ __align__(128) __half smem_b[TILE_ELEM];
+
+    unsigned int smem_a_addr, smem_b_addr;
+    asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(smem_a_addr) : "l"(smem_a));
+    asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(smem_b_addr) : "l"(smem_b));
+
+    float c[4][8];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 8; ++j)
+            c[i][j] = 0.f;
+
+    unsigned int a0, a1, a2, a3;
+    unsigned int b0, b1, b2, b3;
+
+    for (int kg = 0; kg < N_K_GROUPS; ++kg) {
+        const __half *a_tensor = A_retiled + (size_t)kg * M_GLOBAL * K_GROUP;
+        const __half *b_tensor = B_retiled + (size_t)(kg * N_N_GROUPS + ng) * K_GROUP * N_GROUP;
+
+        if (lane == 0) {
+            asm volatile(
+                "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
+                " [%0], [%1],"
+                " {%2, %3, %4, %5, %6, %7},"
+                " {%8, %9, %10, %11};"
+                :: "r"(smem_a_addr), "l"(a_tensor),
+                   "r"(M_GLOBAL), "r"(1), "r"(K_GROUP),
+                   "r"(tile_row * TILE_M), "r"(0), "r"(0),
+                   "r"(TILE_M), "r"(1), "r"(K_GROUP), "r"(1));
+        }
+
+        for (int kt = 0; kt < K_GROUP / TILE_K; ++kt) {
+            if (lane == 0) {
+                asm volatile(
+                    "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
+                    " [%0], [%1],"
+                    " {%2, %3, %4, %5, %6, %7},"
+                    " {%8, %9, %10, %11};"
+                    :: "r"(smem_b_addr), "l"(b_tensor),
+                       "r"(K_GROUP), "r"(1), "r"(N_GROUP),
+                       "r"(kt * TILE_K), "r"(0), "r"(0),
+                       "r"(TILE_K), "r"(1), "r"(N_GROUP), "r"(1));
+                asm volatile("ppu.cp.async.commit_group;");
+                asm volatile("ppu.cp.async.wait_group 0;");
+            }
+
+            __syncthreads();
+
+            #pragma unroll
+            for (int nt = 0; nt < N_GROUP / TILE_N; ++nt) {
+                int ch_off_a = kt * 32;
+                int ch_off_b = nt * 32;
+
+                asm volatile(
+                    "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
+                    " {%0, %1, %2, %3}, [%4],"
+                    " {%5, %6, %7, %8, %9, %10};"
+                    : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                    : "r"(smem_a_addr),
+                      "r"(0), "r"(0), "r"(TILE_M), "r"(1), "r"(1), "r"(ch_off_a));
+
+                asm volatile(
+                    "ppu.tc01.ldmatrix.swzl.sync.aligned.m16n16.x1.trans.shared.b16"
+                    " {%0, %1, %2, %3}, [%4],"
+                    " {%5, %6, %7, %8, %9, %10};"
+                    : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                    : "r"(smem_b_addr),
+                      "r"(0), "r"(0), "r"(TILE_K), "r"(1), "r"(1), "r"(ch_off_b));
+
+                // FP16 MMA: f32.f16.f16.f32
+                asm volatile(
+                    "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+                    "{%8,%9,%10,%11}, "
+                    "{%12,%13,%14,%15}, "
+                    "{%16,%17,%18,%19,%20,%21,%22,%23};"
+                    : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3]),
+                      "+f"(c[nt][4]), "+f"(c[nt][5]), "+f"(c[nt][6]), "+f"(c[nt][7])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                      "r"(b0), "r"(b1), "r"(b2), "r"(b3),
+                      "f"(c[nt][0]), "f"(c[nt][1]), "f"(c[nt][2]), "f"(c[nt][3]),
+                      "f"(c[nt][4]), "f"(c[nt][5]), "f"(c[nt][6]), "f"(c[nt][7]));
+            }
+
+            __syncthreads();
+        }
+    }
+
+    const int r_blk = lane / 4;
+    const int c_blk = lane % 4;
+
+    #pragma unroll
+    for (int nt = 0; nt < N_GROUP / TILE_N; ++nt) {
+        float *d_base = D + tile_row * TILE_M * N + (ng * N_GROUP + nt * TILE_N);
+        d_base[(r_blk) * N + (c_blk + 0)]      = c[nt][0];
+        d_base[(r_blk) * N + (c_blk + 4)]      = c[nt][1];
+        d_base[(r_blk) * N + (c_blk + 8)]      = c[nt][2];
+        d_base[(r_blk) * N + (c_blk + 12)]     = c[nt][3];
+        d_base[(8 + r_blk) * N + (c_blk + 0)]  = c[nt][4];
+        d_base[(8 + r_blk) * N + (c_blk + 4)]  = c[nt][5];
+        d_base[(8 + r_blk) * N + (c_blk + 8)]  = c[nt][6];
+        d_base[(8 + r_blk) * N + (c_blk + 12)] = c[nt][7];
+    }
+}
+
+static void retile_A(const __half *A, __half *A_retiled, int M, int K)
+{
+    for (int kg = 0; kg < K / K_GROUP; ++kg)
+        for (int m = 0; m < M; ++m)
+            for (int c = 0; c < K_GROUP; ++c)
+                A_retiled[(size_t)kg * M * K_GROUP + m * K_GROUP + c]
+                    = A[(size_t)m * K + (kg * K_GROUP + c)];
+}
+
+static void retile_B(const __half *B, __half *B_retiled, int N, int K)
+{
+    for (int kg = 0; kg < K / K_GROUP; ++kg)
+        for (int ng = 0; ng < N / N_GROUP; ++ng)
+            for (int r = 0; r < K_GROUP; ++r)
+                for (int c = 0; c < N_GROUP; ++c)
+                    B_retiled[(size_t)(kg * (N / N_GROUP) + ng) * K_GROUP * N_GROUP
+                              + r * N_GROUP + c]
+                        = B[(size_t)(kg * K_GROUP + r) * N + (ng * N_GROUP + c)];
+}
+
+static void gemm_cpu_ref(float *D, const __half *A, const __half *B, int M, int N, int K)
+{
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k)
+                sum += __half2float(A[i * K + k]) * __half2float(B[k * N + j]);
+            D[i * N + j] = sum;
+        }
+}
+
+int main(int argc, char **argv)
+{
+    printf("[aiu_gemm] FP16 GEMM via AIU .swzl — Simplified Tiling\n\n");
+    printf("  D = A * B,  A[%d×%d] fp16,  B[%d×%d] fp16,  D[%d×%d] f32\n",
+           M_GLOBAL, K_GLOBAL, K_GLOBAL, N_GLOBAL, M_GLOBAL, N_GLOBAL);
+
+    findHggcDevice(argc, (const char **)argv);
+
+    const size_t a_bytes = M_GLOBAL * K_GLOBAL * sizeof(__half);
+    const size_t b_bytes = K_GLOBAL * N_GLOBAL * sizeof(__half);
+    const size_t d_bytes = M_GLOBAL * N_GLOBAL * sizeof(float);
+
+    const size_t a_retiled_elems = (K_GLOBAL / K_GROUP) * M_GLOBAL * K_GROUP;
+    const size_t b_retiled_elems = (K_GLOBAL / K_GROUP) * (N_GLOBAL / N_GROUP) * K_GROUP * N_GROUP;
+
+    __half *h_A = (__half *)malloc(a_bytes);
+    __half *h_B = (__half *)malloc(b_bytes);
+    __half *h_A_retiled = (__half *)malloc(a_retiled_elems * sizeof(__half));
+    __half *h_B_retiled = (__half *)malloc(b_retiled_elems * sizeof(__half));
+    float *h_D_ppu = (float *)malloc(d_bytes);
+    float *h_D_ref = (float *)malloc(d_bytes);
+
+    srand(42);
+    // Non-uniform integer distribution: small/medium/large mix
+    auto rand_int = []() -> int {
+        int r = rand() % 100;
+        if (r < 50)  return (rand() % 11) - 5;       // 50%: [-5, 5]
+        if (r < 80)  return (rand() % 41) - 20;      // 30%: [-20, 20]
+        return (rand() % 201) - 100;                  // 20%: [-100, 100]
+    };
+    for (int i = 0; i < M_GLOBAL * K_GLOBAL; ++i)
+        h_A[i] = __float2half((float)rand_int());
+    for (int i = 0; i < K_GLOBAL * N_GLOBAL; ++i)
+        h_B[i] = __float2half((float)rand_int());
+
+    retile_A(h_A, h_A_retiled, M_GLOBAL, K_GLOBAL);
+    retile_B(h_B, h_B_retiled, N_GLOBAL, K_GLOBAL);
+
+    __half *d_A_retiled, *d_B_retiled;
+    float *d_D;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_A_retiled), a_retiled_elems * sizeof(__half)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_B_retiled), b_retiled_elems * sizeof(__half)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_D), d_bytes));
+    checkHggcErrors(hggcMemcpy(d_A_retiled, h_A_retiled, a_retiled_elems * sizeof(__half), hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_B_retiled, h_B_retiled, b_retiled_elems * sizeof(__half), hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemset(d_D, 0, d_bytes));
+
+    dim3 grid(N_N_GROUPS, M_GLOBAL / TILE_M);
+    dim3 block(kBlockSize);
+
+    HggcTimer timer;
+    timer.start();
+    aiu_gemm_kernel<<<grid, block>>>(d_A_retiled, d_B_retiled, d_D, N_GLOBAL, K_GLOBAL);
+    getLastHggcError("aiu_gemm_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    printf("  PPU kernel time: %.3f ms\n", timer.elapsed());
+
+    checkHggcErrors(hggcMemcpy(h_D_ppu, d_D, d_bytes, hggcMemcpyDeviceToHost));
+    gemm_cpu_ref(h_D_ref, h_A, h_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+
+    float max_rel = 0.0f, max_abs = 0.0f;
+    for (int i = 0; i < M_GLOBAL * N_GLOBAL; ++i) {
+        float diff = fabsf(h_D_ppu[i] - h_D_ref[i]);
+        float scale = fmaxf(fabsf(h_D_ref[i]), 1e-6f);
+        max_rel = fmaxf(max_rel, diff / scale);
+        max_abs = fmaxf(max_abs, diff);
+    }
+    bool pass = (max_rel < 0.05f);
+    printf("  Max absolute error: %e\n", max_abs);
+    printf("  Max relative error: %e\n", max_rel);
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+
+    free(h_A); free(h_B); free(h_A_retiled); free(h_B_retiled);
+    free(h_D_ppu); free(h_D_ref);
+    checkHggcErrors(hggcFree(d_A_retiled));
+    checkHggcErrors(hggcFree(d_B_retiled));
+    checkHggcErrors(hggcFree(d_D));
+
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

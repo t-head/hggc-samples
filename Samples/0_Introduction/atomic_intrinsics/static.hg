@@ -1,0 +1,103 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+#include <hggc_runtime.h>
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+#include "atomic_kernel.hgh"
+
+/// Run every supported atomic primitive once per active thread.
+__global__ void atomic_op_suite(int *slots)
+{
+    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    /// Bitwise group.
+    atomicAnd(&slots[kSlotAnd], 2 * tid + 7);
+    atomicOr (&slots[kSlotOr],  1 << tid);
+    atomicXor(&slots[kSlotXor], tid);
+
+    /// Arithmetic group.
+    atomicAdd(&slots[kSlotAdd], 10);
+    atomicSub(&slots[kSlotSub], 10);
+    atomicExch(&slots[kSlotExch], tid);
+    atomicMax(&slots[kSlotMax], tid);
+    atomicMin(&slots[kSlotMin], tid);
+
+    /// Counter group.
+    atomicInc((unsigned int *)&slots[kSlotInc], ATOMIC_INC_LIMIT);
+    atomicDec((unsigned int *)&slots[kSlotDec], ATOMIC_DEC_LIMIT);
+    atomicCAS(&slots[kSlotCas], tid - 1, tid);
+}
+
+namespace {
+
+constexpr unsigned int kThreadsPerBlock = 256;
+constexpr unsigned int kBlocksPerGrid   = 64;
+
+constexpr const char *kSampleLabel = "atomic_intrinsics_static";
+
+/// Initialise the host scratch buffer with kernel-friendly seed values.
+void seed_host_buffer(int *host_slots) {
+    for (int i = 0; i < kAtomicSlotCount; ++i) {
+        host_slots[i] = 0;
+    }
+    host_slots[kSlotAnd] = ATOMIC_BITWISE_SEED;
+    host_slots[kSlotXor] = ATOMIC_BITWISE_SEED;
+}
+
+}  /// anonymous
+
+extern "C" bool computeGold(int *ppuData, const int len);
+
+int main(int argc, char **argv) {
+    std::printf("%s starting...\n", kSampleLabel);
+
+    findHggcDevice(argc, (const char **)argv);
+
+    HggcTimer timer;
+    timer.start();
+
+    constexpr unsigned int byte_count = sizeof(int) * kAtomicSlotCount;
+
+    /// Pinned staging area on the host.
+    int *host_slots = nullptr;
+    checkHggcErrors(hggcMallocHost(&host_slots, byte_count));
+    seed_host_buffer(host_slots);
+
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+
+    int *dev_slots = nullptr;
+    checkHggcErrors(hggcMalloc((void **)&dev_slots, byte_count));
+    checkHggcErrors(hggcMemcpyAsync(dev_slots, host_slots, byte_count,
+                                    hggcMemcpyHostToDevice, stream));
+
+    atomic_op_suite<<<kBlocksPerGrid, kThreadsPerBlock, 0, stream>>>(dev_slots);
+
+    checkHggcErrors(hggcMemcpyAsync(host_slots, dev_slots, byte_count,
+                                    hggcMemcpyDeviceToHost, stream));
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    timer.stop();
+    std::printf("Processing time: %f (ms)\n", timer.elapsed());
+
+    bool ok = computeGold(host_slots, kThreadsPerBlock * kBlocksPerGrid);
+
+    checkHggcErrors(hggcStreamDestroy(stream));
+    checkHggcErrors(hggcFree(dev_slots));
+    checkHggcErrors(hggcFreeHost(host_slots));
+
+    std::printf("%s completed, returned %s\n", kSampleLabel, ok ? "OK" : "ERROR!");
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

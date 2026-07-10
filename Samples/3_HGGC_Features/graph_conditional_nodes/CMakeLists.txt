@@ -1,0 +1,2 @@
+add_executable(graph_conditional_nodes graph_conditional_nodes.hg)
+target_include_directories(graph_conditional_nodes PRIVATE ${COMMON_DIR})

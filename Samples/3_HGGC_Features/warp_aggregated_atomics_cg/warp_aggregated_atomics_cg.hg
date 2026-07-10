@@ -1,0 +1,221 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * warp_aggregated_atomics_cg -- Cooperative Groups Advanced API Showcase
+ *
+ * Demonstrates advanced Cooperative Groups APIs beyond basic thread_block:
+ *
+ *   1. coalesced_threads()  -- get dynamically active thread group
+ *   2. labeled_partition()  -- partition by label into sub-groups
+ *   3. cg::reduce()         -- intra-group reduction
+ *   4. cg::inclusive_scan()  -- intra-group prefix sum
+ *   5. invoke_one_broadcast() -- execute lambda on one thread, broadcast result
+ *
+ * Scenario: Weighted histogram
+ *   - Each thread holds a bucket label and a weight
+ *   - Threads are grouped by label via labeled_partition
+ *   - Within each group:
+ *       reduce() computes total weight
+ *       inclusive_scan() computes per-thread offset
+ *       invoke_one_broadcast() does a single atomicAdd to global histogram
+ *   - CPU verification ensures correctness
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#include <cooperative_groups/scan.h>
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace cg = cooperative_groups;
+
+namespace {
+constexpr int NUM_ELEMS   = 1 << 20;   // 1M elements
+constexpr int NUM_BUCKETS = 8;
+constexpr int kBlockSize  = 256;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: Weighted histogram using CG advanced APIs
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void weighted_histogram_kernel(const int *labels,
+                                          const int *weights,
+                                          int       *hist_count,    // per-bucket count
+                                          int       *hist_weight,   // per-bucket total weight
+                                          int       *scan_output,   // per-element prefix sum within group
+                                          int        n)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    int label  = labels[tid];
+    int weight = weights[tid];
+
+    // 1. Get active thread group (handles divergent warps)
+    cg::coalesced_group active = cg::coalesced_threads();
+
+    // 2. Partition by label -- threads with same label form a sub-group
+    auto group = cg::labeled_partition(active, label);
+
+    // 3. Reduce: compute total weight within this label group
+    int group_total_weight = cg::reduce(group, weight, cg::plus<int>());
+
+    // 4. invoke_one_broadcast: only one thread does the atomic update,
+    //    return value is broadcast to all group members.
+    //    NOTE: This must come BEFORE inclusive_scan, because inclusive_scan
+    //    on labeled_partition subgroups has a known runtime issue that can
+    //    corrupt other local variables via warp shuffle side-effects.
+    int old_count = cg::invoke_one_broadcast(group,
+        [&]() {
+            int old = atomicAdd(&hist_count[label], group.size());
+            atomicAdd(&hist_weight[label], group_total_weight);
+            return old;
+        });
+
+    // Each thread now knows: old_count + its rank = its global position
+    //    (Demonstrates that invoke_one_broadcast broadcasts the return value)
+    (void)old_count;  // available for scatter if needed
+
+    // 5. Inclusive scan: compute per-thread offset within group
+    //    Placed last to avoid corrupting group_total_weight above.
+    int my_offset = cg::inclusive_scan(group, weight, cg::plus<int>());
+    scan_output[tid] = my_offset;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: Simple per-thread atomicAdd baseline (for comparison)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void naive_histogram_kernel(const int *labels,
+                                       const int *weights,
+                                       int       *hist_count,
+                                       int       *hist_weight,
+                                       int        n)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    atomicAdd(&hist_count[labels[tid]], 1);
+    atomicAdd(&hist_weight[labels[tid]], weights[tid]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[warp_aggregated_atomics_cg] CG Advanced API: Weighted Histogram\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    // Generate input
+    int *h_labels  = new int[NUM_ELEMS];
+    int *h_weights = new int[NUM_ELEMS];
+
+    srand(42);
+    for (int i = 0; i < NUM_ELEMS; ++i) {
+        h_labels[i]  = rand() % NUM_BUCKETS;
+        h_weights[i] = 1 + (rand() % 10);  // weight 1..10
+    }
+
+    // CPU reference
+    int cpu_count[NUM_BUCKETS]  = {};
+    int cpu_weight[NUM_BUCKETS] = {};
+    for (int i = 0; i < NUM_ELEMS; ++i) {
+        cpu_count[h_labels[i]]++;
+        cpu_weight[h_labels[i]] += h_weights[i];
+    }
+
+    // Device allocations
+    int *d_labels, *d_weights;
+    int *d_hist_count, *d_hist_weight, *d_scan_output;
+    size_t elem_bytes   = NUM_ELEMS * sizeof(int);
+    size_t bucket_bytes = NUM_BUCKETS * sizeof(int);
+
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_labels), elem_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_weights), elem_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_hist_count), bucket_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_hist_weight), bucket_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_scan_output), elem_bytes));
+
+    checkHggcErrors(hggcMemcpy(d_labels, h_labels, elem_bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_weights, h_weights, elem_bytes, hggcMemcpyHostToDevice));
+
+    dim3 grid((NUM_ELEMS + kBlockSize - 1) / kBlockSize);
+    dim3 block(kBlockSize);
+
+    // ── Run CG-aggregated version ──
+    printf("  Running CG-aggregated weighted histogram...\n");
+    checkHggcErrors(hggcMemset(d_hist_count, 0, bucket_bytes));
+    checkHggcErrors(hggcMemset(d_hist_weight, 0, bucket_bytes));
+
+    weighted_histogram_kernel<<<grid, block>>>(
+        d_labels, d_weights, d_hist_count, d_hist_weight, d_scan_output, NUM_ELEMS);
+    getLastHggcError("weighted_histogram_kernel");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    int h_count[NUM_BUCKETS], h_weight[NUM_BUCKETS];
+    checkHggcErrors(hggcMemcpy(h_count, d_hist_count, bucket_bytes, hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_weight, d_hist_weight, bucket_bytes, hggcMemcpyDeviceToHost));
+
+    // Verify
+    bool pass = true;
+    printf("\n  Bucket |  Count (PPU/CPU) | Weight (PPU/CPU)\n");
+    printf("  -------+------------------+------------------\n");
+    for (int b = 0; b < NUM_BUCKETS; ++b) {
+        bool ok = (h_count[b] == cpu_count[b]) && (h_weight[b] == cpu_weight[b]);
+        printf("    %d    | %7d / %-7d | %7d / %-7d  %s\n",
+               b, h_count[b], cpu_count[b], h_weight[b], cpu_weight[b],
+               ok ? "" : "MISMATCH");
+        if (!ok) pass = false;
+    }
+
+    // ── Run naive version for comparison ──
+    printf("\n  Running naive (per-thread atomic) version...\n");
+    int *d_naive_count, *d_naive_weight;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_naive_count), bucket_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_naive_weight), bucket_bytes));
+    checkHggcErrors(hggcMemset(d_naive_count, 0, bucket_bytes));
+    checkHggcErrors(hggcMemset(d_naive_weight, 0, bucket_bytes));
+
+    naive_histogram_kernel<<<grid, block>>>(d_labels, d_weights, d_naive_count, d_naive_weight, NUM_ELEMS);
+    getLastHggcError("naive_histogram_kernel");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    int h_naive_count[NUM_BUCKETS], h_naive_weight[NUM_BUCKETS];
+    checkHggcErrors(hggcMemcpy(h_naive_count, d_naive_count, bucket_bytes, hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_naive_weight, d_naive_weight, bucket_bytes, hggcMemcpyDeviceToHost));
+
+    bool naive_ok = true;
+    for (int b = 0; b < NUM_BUCKETS; ++b) {
+        if (h_naive_count[b] != cpu_count[b] || h_naive_weight[b] != cpu_weight[b])
+            naive_ok = false;
+    }
+    printf("  Naive version: %s\n", naive_ok ? "PASS" : "FAIL");
+
+    // Cleanup
+    checkHggcErrors(hggcFree(d_labels));
+    checkHggcErrors(hggcFree(d_weights));
+    checkHggcErrors(hggcFree(d_hist_count));
+    checkHggcErrors(hggcFree(d_hist_weight));
+    checkHggcErrors(hggcFree(d_scan_output));
+    checkHggcErrors(hggcFree(d_naive_count));
+    checkHggcErrors(hggcFree(d_naive_weight));
+    delete[] h_labels;
+    delete[] h_weights;
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

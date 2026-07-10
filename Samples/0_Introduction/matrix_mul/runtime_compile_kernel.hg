@@ -1,0 +1,54 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+template <int kTile>
+__device__ void gemm_bias_impl(
+    float *C, const float *A, const float *B,
+    int wA, int wB, float alpha, float beta)
+{
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    float acc = 0.0f;
+
+    for (int phase = 0; phase < wA; phase += kTile) {
+        __shared__ float sA[kTile][kTile];
+        __shared__ float sB[kTile][kTile];
+
+        sA[ty][tx] = A[(by * kTile + ty) * wA + phase + tx];
+        sB[ty][tx] = B[(phase + ty) * wB + bx * kTile + tx];
+        cg::sync(cg::this_thread_block());
+
+        for (int k = 0; k < kTile; k++)
+            acc += sA[ty][k] * sB[k][tx];
+        cg::sync(cg::this_thread_block());
+    }
+
+    int row = by * kTile + ty;
+    int col = bx * kTile + tx;
+    C[row * wB + col] = alpha * acc + beta * C[row * wB + col];
+}
+
+extern "C" __global__ void gemm_bias_b16(
+    float *C, const float *A, const float *B,
+    int wA, int wB, float alpha, float beta)
+{
+    gemm_bias_impl<16>(C, A, B, wA, wB, alpha, beta);
+}
+
+extern "C" __global__ void gemm_bias_b32(
+    float *C, const float *A, const float *B,
+    int wA, int wB, float alpha, float beta)
+{
+    gemm_bias_impl<32>(C, A, B, wA, wB, alpha, beta);
+}

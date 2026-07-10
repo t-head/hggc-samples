@@ -1,0 +1,234 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * mem_strategy_bench.hg -- Memory Allocation Strategy Performance
+ *
+ * Compares 4 PPU memory allocation strategies for a simple scale kernel:
+ *   1. Managed Memory (hggcMallocManaged + prefetch)
+ *   2. Zero Copy (hggcHostAlloc + hggcHostGetDevicePointer)
+ *   3. Pinned + Async Memcpy (hggcHostAlloc + hggcMemcpyAsync)
+ *   4. Pageable + Sync Memcpy (malloc + hggcMemcpy)
+ *
+ * Measures total round-trip time (alloc → H2D → kernel → D2H → verify)
+ * for multiple data sizes to show scaling behavior.
+ */
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <hggc.h>  /* HGGC_VERSION */
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+/* ── Configuration ─────────────────────────────────────────── */
+
+constexpr float kScale = 2.5f;
+constexpr int kIters = 20;
+
+enum AllocStrategy { ALLOC_MANAGED, ALLOC_ZERO_COPY, ALLOC_PINNED_ASYNC, ALLOC_PAGEABLE };
+
+static const char *kStrategyNames[] = {
+    "Managed Memory", "Zero Copy", "Pinned+Async", "Pageable+Sync"
+};
+
+static const int kTestSizes[] = {65536, 262144, 1048576};
+static const int kNumSizes = 3;
+
+/* ── Device kernel: element-wise scale ─────────────────────── */
+
+__global__ void scale_kernel(float *data, int n, float factor)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        data[idx] *= factor;
+}
+
+/* ── MemLocation helper for prefetch ───────────────────────── */
+
+#if HGGC_VERSION >= 13000
+static hggcMemLocation makeMemLocDevice(int dev)
+{
+    hggcMemLocation loc;
+    loc.type = hggcMemLocationTypeDevice;
+    loc.id = dev;
+    return loc;
+}
+
+static hggcMemLocation makeMemLocHost()
+{
+    hggcMemLocation loc;
+    loc.type = hggcMemLocationTypeHost;
+    loc.id = 0;
+    return loc;
+}
+#define PREFETCH_ASYNC(ptr, sz, dev, stream) \
+    hggcMemPrefetchAsync(ptr, sz, makeMemLocDevice(dev), stream)
+#else
+#define PREFETCH_ASYNC(ptr, sz, dev, stream) \
+    hggcMemPrefetchAsync(ptr, sz, dev, stream)
+#endif
+
+/* ── Benchmark one strategy ────────────────────────────────── */
+
+static double benchmark_strategy(
+    AllocStrategy strategy, int n, int dev_id, bool *ok)
+{
+    size_t bytes = (size_t)n * sizeof(float);
+    int threads = 256;
+    int grid = (n + threads - 1) / threads;
+
+    /* Host input */
+    float *h_in = (float *)malloc(bytes);
+    float *h_out = (float *)malloc(bytes);
+    for (int i = 0; i < n; i++)
+        h_in[i] = static_cast<float>(i % 100) * 0.1f;
+
+    float *d_data = nullptr;
+    float *h_pinned = nullptr;
+
+    /* Allocate based on strategy */
+    switch (strategy) {
+    case ALLOC_MANAGED:
+        checkHggcErrors(hggcMallocManaged(&d_data, bytes));
+        memcpy(d_data, h_in, bytes);  /* host write to managed memory */
+        checkHggcErrors(PREFETCH_ASYNC(d_data, bytes, dev_id, 0));
+        break;
+    case ALLOC_ZERO_COPY:
+        checkHggcErrors(hggcHostAlloc((void **)&h_pinned, bytes, hggcHostAllocMapped));
+        memcpy(h_pinned, h_in, bytes);
+        checkHggcErrors(hggcHostGetDevicePointer(&d_data, h_pinned, 0));
+        break;
+    case ALLOC_PINNED_ASYNC:
+        checkHggcErrors(hggcHostAlloc((void **)&h_pinned, bytes, hggcHostAllocPortable));
+        memcpy(h_pinned, h_in, bytes);
+        checkHggcErrors(hggcMalloc(&d_data, bytes));
+        checkHggcErrors(hggcMemcpy(d_data, h_pinned, bytes, hggcMemcpyHostToDevice));
+        break;
+    case ALLOC_PAGEABLE:
+        checkHggcErrors(hggcMalloc(&d_data, bytes));
+        checkHggcErrors(hggcMemcpy(d_data, h_in, bytes, hggcMemcpyHostToDevice));
+        break;
+    }
+
+    /* Warmup */
+    scale_kernel<<<grid, threads>>>(d_data, n, kScale);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /* Timed iterations: reset input → kernel → read output */
+    HggcTimer timer;
+    timer.start();
+    for (int i = 0; i < kIters; i++) {
+        /* Reset input data */
+        if (strategy == ALLOC_MANAGED) {
+            memcpy(d_data, h_in, bytes);
+            checkHggcErrors(PREFETCH_ASYNC(d_data, bytes,
+                                              dev_id, 0));
+        } else if (strategy == ALLOC_ZERO_COPY) {
+            memcpy(h_pinned, h_in, bytes);
+        } else if (strategy == ALLOC_PINNED_ASYNC) {
+            checkHggcErrors(hggcMemcpyAsync(d_data, h_pinned, bytes,
+                                             hggcMemcpyHostToDevice));
+            memcpy(h_pinned, h_in, bytes);
+            checkHggcErrors(hggcMemcpyAsync(d_data, h_pinned, bytes,
+                                             hggcMemcpyHostToDevice));
+        } else {
+            checkHggcErrors(hggcMemcpy(d_data, h_in, bytes,
+                                        hggcMemcpyHostToDevice));
+        }
+
+        scale_kernel<<<grid, threads>>>(d_data, n, kScale);
+
+        /* Read output */
+        if (strategy == ALLOC_MANAGED) {
+            checkHggcErrors(hggcDeviceSynchronize());
+            memcpy(h_out, d_data, bytes);
+        } else if (strategy == ALLOC_ZERO_COPY) {
+            checkHggcErrors(hggcDeviceSynchronize());
+            memcpy(h_out, h_pinned, bytes);
+        } else if (strategy == ALLOC_PINNED_ASYNC) {
+            checkHggcErrors(hggcMemcpyAsync(h_pinned, d_data, bytes,
+                                             hggcMemcpyDeviceToHost));
+            checkHggcErrors(hggcDeviceSynchronize());
+            memcpy(h_out, h_pinned, bytes);
+        } else {
+            checkHggcErrors(hggcMemcpy(h_out, d_data, bytes,
+                                        hggcMemcpyDeviceToHost));
+        }
+    }
+    timer.stop();
+
+    double ms = timer.elapsed() / kIters;
+    double gbps = 2.0 * bytes / (ms * 1e-3 * 1e9);
+
+    /* Verify: output should be input * scale */
+    *ok = true;
+    for (int i = 0; i < n; i++) {
+        float expected = h_in[i] * kScale;
+        float diff = h_out[i] - expected;
+        if (diff < 0) diff = -diff;
+        if (diff > 1e-3f * fabsf(expected + 1.0f)) {
+            *ok = false;
+            break;
+        }
+    }
+
+    /* Cleanup */
+    if (strategy == ALLOC_MANAGED)
+        checkHggcErrors(hggcFree(d_data));
+    else if (strategy == ALLOC_ZERO_COPY || strategy == ALLOC_PINNED_ASYNC) {
+        checkHggcErrors(hggcFreeHost(h_pinned));
+        if (strategy == ALLOC_PINNED_ASYNC)
+            checkHggcErrors(hggcFree(d_data));
+    } else {
+        checkHggcErrors(hggcFree(d_data));
+    }
+    free(h_in);
+    free(h_out);
+
+    return gbps;
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[mem_strategy_bench] Memory Allocation Strategy Performance\n\n");
+
+    int dev_id = findHggcDevice(argc, (const char **)argv);
+
+    printf("  Kernel: out[i] = in[i] * %.2f (per-element scale)\n", kScale);
+    printf("  Iterations: %d\n\n", kIters);
+
+    printf("  %-20s  %-8s  %12s  %s\n", "Strategy", "Size", "Throughput", "Result");
+    printf("  %-20s  %-8s  %12s  %s\n", "--------", "----", "----------", "------");
+
+    bool all_ok = true;
+
+    for (int s = 0; s < kNumSizes; s++) {
+        int n = kTestSizes[s];
+        for (int strat = 0; strat < 4; strat++) {
+            bool ok = false;
+            double gbps = benchmark_strategy(
+                (AllocStrategy)strat, n, dev_id, &ok);
+            if (!ok) all_ok = false;
+
+            printf("  %-20s  %4dKB   %10.2f GB/s  %s\n",
+                   kStrategyNames[strat],
+                   (int)((size_t)n * sizeof(float) / 1024),
+                   gbps, ok ? "OK" : "FAIL");
+        }
+        printf("\n");
+    }
+
+    printf("  Result: %s\n", all_ok ? "PASS" : "FAIL");
+    return all_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

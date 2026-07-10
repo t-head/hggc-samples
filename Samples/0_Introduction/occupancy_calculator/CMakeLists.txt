@@ -1,0 +1,2 @@
+add_executable(occupancy_calculator occupancy_calculator.hg)
+target_include_directories(occupancy_calculator PRIVATE ${COMMON_DIR})

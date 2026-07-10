@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * assert_kernel.hg — Device-side assert as an invariant checker
+ *
+ * Two kernels:
+ *   1. prefix_max_kernel: computes a running maximum (output must be
+ *      monotonically non-decreasing).
+ *   2. validate_monotonic_kernel: asserts the monotonicity invariant
+ *      on an arbitrary float array.  If any violation exists, the
+ *      device-side assert fires and the host observes the failure.
+ */
+#ifndef __HGGC_ARCH__
+#include <cassert>
+#endif
+
+/// Compute a running maximum: out[i] = max(in[0], in[1], ..., in[i]).
+/// Simple sequential-per-thread: each thread handles a contiguous chunk.
+extern "C" __global__ void prefix_max_kernel(
+    const float * __restrict__ input,
+    float       * __restrict__ output,
+    int n)
+{
+    const int tid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = gridDim.x * blockDim.x;
+
+    // Each thread processes elements [start, start+chunk)
+    const int chunk = (n + total - 1) / total;
+    const int start = tid * chunk;
+    const int end   = (start + chunk < n) ? (start + chunk) : n;
+
+    if (start >= n) return;
+
+    float running = input[start];
+    output[start] = running;
+    for (int i = start + 1; i < end; ++i) {
+        if (input[i] > running) running = input[i];
+        output[i] = running;
+    }
+}
+
+/// Validate that array[i] <= array[i+1] for all i in [0, n-2].
+/// Each thread checks one pair.  A violation triggers a device assert.
+extern "C" __global__ void validate_monotonic_kernel(
+    const float * __restrict__ array,
+    int n)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n - 1) return;
+
+    // This assert fires if the monotonicity invariant is violated.
+    assert(array[tid] <= array[tid + 1]);
+}

@@ -1,0 +1,305 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * aiu_throughput.hg -- AIU Bulk Copy vs cp.async Copy Throughput
+ *
+ * Copies bf16 tensors of increasing size from global memory through
+ * shared memory and back, comparing two PPU async copy mechanisms:
+ *   1. cp.async: per-thread 4-byte async copy with commit/wait
+ *   2. AIU bulk: per-warp tensor copy with swizzle + ldmatrix.swzl decode
+ *
+ * Tests multiple tensor sizes (2KB to 32KB) to show scaling behavior.
+ * Both methods verify data integrity (output == input).
+ */
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+/* ── Fixed tile parameters ─────────────────────────────────── */
+
+constexpr int MAT_C   = 64;   // channels (128 bytes/row, 128B swizzle)
+constexpr int TILE_H  = 16;   // rows per AIU tile
+constexpr int WARP_SZ = 32;
+constexpr int N_LDMATRIX = 4;
+
+/* Test sizes: number of rows (must be multiple of TILE_H) */
+static const int kTestRows[] = {16, 32, 64, 128, 256};
+static const int kNumTests = 5;
+static const int kIterations = 1000;
+
+/* ── Kernel 1: cp.async copy ───────────────────────────────── */
+
+__global__ void cp_async_copy_kernel(
+    const uint16_t * __restrict__ input,
+    uint16_t * __restrict__ output,
+    int total_bytes,
+    int n_threads)
+{
+    extern __shared__ __align__(128) uint16_t smem[];
+
+    int tid = threadIdx.x;
+    int copies_per_thread = total_bytes / (n_threads * 4);
+    int byte_offset = tid * copies_per_thread * 4;
+
+    const uint8_t *src = reinterpret_cast<const uint8_t *>(input) + byte_offset;
+
+    unsigned int smem_base;
+    asm("ppu.cvta.to.shared.u32 %0, %1;"
+        : "=r"(smem_base) : "l"(smem));
+    unsigned int smem_addr = smem_base + byte_offset;
+
+    for (int i = 0; i < copies_per_thread; i++) {
+        asm volatile("ppu.cp.async.ca.shared.global [%0], [%1], 4;"
+            :: "r"(smem_addr + i * 4), "l"(src + i * 4));
+    }
+
+    asm volatile("ppu.cp.async.commit_group;");
+    asm volatile("ppu.cp.async.wait_group 0;");
+    __syncthreads();
+
+    /* Write back to global output */
+    int u16_per_thread = total_bytes / (n_threads * 2);
+    int u16_offset = tid * u16_per_thread;
+    for (int i = 0; i < u16_per_thread; i++)
+        output[u16_offset + i] = smem[u16_offset + i];
+}
+
+/* ── Kernel 2: AIU bulk tensor copy ────────────────────────── */
+
+__global__ void aiu_bulk_copy_kernel(
+    const uint16_t * __restrict__ input,
+    uint16_t * __restrict__ output,
+    int big_h)
+{
+    int warpIdx = threadIdx.x / WARP_SZ;
+    int lane    = threadIdx.x % WARP_SZ;
+    int n_warps = big_h / TILE_H;
+
+    extern __shared__ __align__(128) uint16_t smem[];
+    int tile_elem = TILE_H * MAT_C;  // 1024
+    uint16_t *my_smem = smem + warpIdx * tile_elem;
+
+    unsigned int my_smem_addr;
+    asm("ppu.cvta.to.shared.u32 %0, %1;"
+        : "=r"(my_smem_addr) : "l"(my_smem));
+
+    /* Phase 1: AIU async copy (global → shared, swizzle 128B) */
+    if (warpIdx < n_warps && lane == 0) {
+        int start_h = warpIdx * TILE_H;
+        asm volatile(
+            "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
+            " [%0], [%1],"
+            " {%2, %3, %4, %5, %6, %7},"
+            " {%8, %9, %10, %11};"
+            :: "r"(my_smem_addr), "l"(input),
+               "r"(big_h),  "r"(1), "r"(MAT_C),
+               "r"(start_h), "r"(0), "r"(0),
+               "r"(TILE_H), "r"(1), "r"(MAT_C),
+               "r"(1));
+        asm volatile("ppu.cp.async.commit_group;");
+        asm volatile("ppu.cp.async.wait_group 0;");
+    }
+    __syncthreads();
+
+    /* Phase 2: ldmatrix.swzl decode (shared → registers) */
+    unsigned int frag[N_LDMATRIX * 4];
+
+    #pragma unroll
+    for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+        int ch_off = iter * 32;
+        asm volatile(
+            "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
+            " {%0, %1, %2, %3}, [%4],"
+            " {%5, %6, %7, %8, %9, %10};"
+            : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
+              "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
+            : "r"(my_smem_addr),
+              "r"(0), "r"(0), "r"(TILE_H), "r"(1),
+              "r"(1), "r"(ch_off));
+    }
+
+    /* Phase 3: Store fragments to global output */
+    int r_blk = lane / 4;
+    int c_blk = lane % 4;
+    int tile_row = warpIdx * TILE_H;
+
+    #pragma unroll
+    for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+        int ch_base = iter * 16;
+
+        output[(tile_row + r_blk) * MAT_C + ch_base + c_blk*2] =
+            static_cast<uint16_t>(frag[iter*4+0] & 0xFFFFu);
+        output[(tile_row + r_blk) * MAT_C + ch_base + c_blk*2 + 1] =
+            static_cast<uint16_t>((frag[iter*4+0] >> 16) & 0xFFFFu);
+
+        output[(tile_row + r_blk) * MAT_C + ch_base + 8 + c_blk*2] =
+            static_cast<uint16_t>(frag[iter*4+1] & 0xFFFFu);
+        output[(tile_row + r_blk) * MAT_C + ch_base + 8 + c_blk*2 + 1] =
+            static_cast<uint16_t>((frag[iter*4+1] >> 16) & 0xFFFFu);
+
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + c_blk*2] =
+            static_cast<uint16_t>(frag[iter*4+2] & 0xFFFFu);
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + c_blk*2 + 1] =
+            static_cast<uint16_t>((frag[iter*4+2] >> 16) & 0xFFFFu);
+
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + 8 + c_blk*2] =
+            static_cast<uint16_t>(frag[iter*4+3] & 0xFFFFu);
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + 8 + c_blk*2 + 1] =
+            static_cast<uint16_t>((frag[iter*4+3] >> 16) & 0xFFFFu);
+    }
+}
+
+/* ── Verification ──────────────────────────────────────────── */
+
+static bool verify(const uint16_t *out, const uint16_t *in, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (out[i] != in[i]) return false;
+    return true;
+}
+
+/* ── Benchmark helper ──────────────────────────────────────── */
+
+struct BenchResult {
+    double gbps;
+    bool ok;
+};
+
+static BenchResult bench_cp_async(
+    const uint16_t *d_in, uint16_t *d_out,
+    int total_bytes, int n_threads, size_t smem_bytes)
+{
+    /* Warmup */
+    cp_async_copy_kernel<<<1, n_threads, smem_bytes>>>(d_in, d_out, total_bytes, n_threads);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    hggcEvent_t t0, t1;
+    checkHggcErrors(hggcEventCreate(&t0));
+    checkHggcErrors(hggcEventCreate(&t1));
+    checkHggcErrors(hggcEventRecord(t0));
+    for (int i = 0; i < kIterations; i++)
+        cp_async_copy_kernel<<<1, n_threads, smem_bytes>>>(d_in, d_out, total_bytes, n_threads);
+    checkHggcErrors(hggcEventRecord(t1));
+    checkHggcErrors(hggcEventSynchronize(t1));
+    float ms = 0;
+    checkHggcErrors(hggcEventElapsedTime(&ms, t0, t1));
+    checkHggcErrors(hggcEventDestroy(t0));
+    checkHggcErrors(hggcEventDestroy(t1));
+
+    double ms_per = ms / kIterations;
+    BenchResult r;
+    r.gbps = (double)total_bytes / (ms_per * 1e-3 * 1e9);
+    return r;
+}
+
+static BenchResult bench_aiu(
+    const uint16_t *d_in, uint16_t *d_out,
+    int big_h, int n_warps, size_t smem_bytes)
+{
+    int n_threads = n_warps * WARP_SZ;
+
+    aiu_bulk_copy_kernel<<<1, n_threads, smem_bytes>>>(d_in, d_out, big_h);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    hggcEvent_t t0, t1;
+    checkHggcErrors(hggcEventCreate(&t0));
+    checkHggcErrors(hggcEventCreate(&t1));
+    checkHggcErrors(hggcEventRecord(t0));
+    for (int i = 0; i < kIterations; i++)
+        aiu_bulk_copy_kernel<<<1, n_threads, smem_bytes>>>(d_in, d_out, big_h);
+    checkHggcErrors(hggcEventRecord(t1));
+    checkHggcErrors(hggcEventSynchronize(t1));
+    float ms = 0;
+    checkHggcErrors(hggcEventElapsedTime(&ms, t0, t1));
+    checkHggcErrors(hggcEventDestroy(t0));
+    checkHggcErrors(hggcEventDestroy(t1));
+
+    double ms_per = ms / kIterations;
+    BenchResult r;
+    r.gbps = (double)(big_h * MAT_C * 2) / (ms_per * 1e-3 * 1e9);
+    return r;
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[aiu_throughput] AIU vs cp.async Copy Throughput\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    printf("  Tile: %dx1x%d bf16 (%d bytes/tile)\n", TILE_H, MAT_C, TILE_H * MAT_C * 2);
+    printf("  Iters: %d\n\n", kIterations);
+
+    /* Print table header */
+    printf("  %-8s %8s  %14s  %14s  %8s\n", "Size", "Bytes", "cp.async", "AIU bulk", "Speedup");
+    printf("  %-8s %8s  %14s  %14s  %8s\n", "----", "-----", "----------", "---------", "-------");
+
+    /* Allocate max buffer (256x1x64 = 32768 bytes) */
+    int max_elem = 256 * MAT_C;
+    int max_bytes = max_elem * sizeof(uint16_t);
+    uint16_t *h_in = new uint16_t[max_elem];
+    for (int i = 0; i < max_elem; i++)
+        h_in[i] = static_cast<uint16_t>(i + 1);
+
+    uint16_t *d_in = nullptr, *d_out = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_in),  max_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out), max_bytes));
+    checkHggcErrors(hggcMemcpy(d_in, h_in, max_bytes, hggcMemcpyHostToDevice));
+
+    uint16_t *h_out = new uint16_t[max_elem];
+    bool all_ok = true;
+
+    for (int t = 0; t < kNumTests; t++) {
+        int rows = kTestRows[t];
+        int n_elem = rows * MAT_C;
+        int total_bytes = n_elem * sizeof(uint16_t);
+        int n_warps = rows / TILE_H;
+        int n_threads_aiu = n_warps * WARP_SZ;
+        /* cp.async: use same thread count for fair comparison */
+        int n_threads_cp = n_threads_aiu;
+        /* Ensure cp.async copies divide evenly */
+        while (total_bytes % (n_threads_cp * 4) != 0) n_threads_cp--;
+
+        size_t smem_cp = total_bytes;
+        size_t smem_aiu = n_warps * TILE_H * MAT_C * sizeof(uint16_t);
+
+        /* Benchmark cp.async */
+        BenchResult cp = bench_cp_async(d_in, d_out, total_bytes, n_threads_cp, smem_cp);
+        checkHggcErrors(hggcMemcpy(h_out, d_out, total_bytes, hggcMemcpyDeviceToHost));
+        cp.ok = verify(h_out, h_in, n_elem);
+
+        /* Benchmark AIU */
+        BenchResult aiu = bench_aiu(d_in, d_out, rows, n_warps, smem_aiu);
+        checkHggcErrors(hggcMemcpy(h_out, d_out, total_bytes, hggcMemcpyDeviceToHost));
+        aiu.ok = verify(h_out, h_in, n_elem);
+
+        if (!cp.ok || !aiu.ok) all_ok = false;
+
+        printf("  %dx1x%-4d %6dB  %10.2f GB/s  %10.2f GB/s  %6.2fx  %s\n",
+               rows, MAT_C, total_bytes,
+               cp.gbps, aiu.gbps, aiu.gbps / cp.gbps,
+               (cp.ok && aiu.ok) ? "" : "FAIL");
+    }
+
+    printf("\n  Result: %s\n", all_ok ? "PASS" : "FAIL");
+
+    delete[] h_in;
+    delete[] h_out;
+    checkHggcErrors(hggcFree(d_in));
+    checkHggcErrors(hggcFree(d_out));
+
+    return all_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

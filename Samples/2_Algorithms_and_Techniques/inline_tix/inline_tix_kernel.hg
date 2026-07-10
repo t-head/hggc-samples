@@ -1,0 +1,57 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * inline_tix_kernel.hg — TIX instruction kernels (for HGRTC JIT)
+ */
+
+/// FMA Horner: p(x) = ((3*x + 2)*x + 1)*x + 0.5
+extern "C" __global__ void horner_fma_kernel(float *out, const float *x_arr, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float x = x_arr[idx];
+    float result;
+    asm("ppu.fma.rtte.f32 %0, %1, %2, %3;" : "=f"(result) : "f"(3.0f), "f"(x), "f"(2.0f));
+    asm("ppu.fma.rtte.f32 %0, %1, %2, %3;" : "=f"(result) : "f"(result), "f"(x), "f"(1.0f));
+    asm("ppu.fma.rtte.f32 %0, %1, %2, %3;" : "=f"(result) : "f"(result), "f"(x), "f"(0.5f));
+    out[idx] = result;
+}
+
+/// Population count.
+extern "C" __global__ void popc_kernel(int *out, const unsigned int *data, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int val = data[idx];
+    int count;
+    asm("ppu.popc.b32 %0, %1;" : "=r"(count) : "r"(val));
+    out[idx] = count;
+}
+
+/// Wide multiply 32x32 -> 64.
+extern "C" __global__ void wide_mul_kernel(long long *out, const int *a, const int *b, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    long long product;
+    asm("ppu.mul.wide.s32 %0, %1, %2;" : "=l"(product) : "r"(a[idx]), "r"(b[idx]));
+    out[idx] = product;
+}
+
+/// Bit-field extract.
+extern "C" __global__ void bfe_kernel(unsigned int *out, const unsigned int *data,
+                                       int pos, int len, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    unsigned int extracted;
+    asm("ppu.bfe.u32 %0, %1, %2, %3;" : "=r"(extracted) : "r"(data[idx]), "r"(pos), "r"(len));
+    out[idx] = extracted;
+}

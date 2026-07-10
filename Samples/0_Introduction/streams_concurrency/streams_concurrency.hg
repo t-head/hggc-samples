@@ -1,0 +1,488 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <cooperative_groups.h>
+#include <hggc_runtime.h>
+
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+namespace cg = cooperative_groups;
+
+#ifndef MAX
+#define MAX(a, b) (a > b ? a : b)
+#endif
+
+namespace {
+
+enum class StreamsDemo { kAuto, kStreams, kHyperQ, kMultiCopy };
+
+StreamsDemo parse_mode(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strncmp(argv[i], "--mode=", 7) == 0) {
+            const char *kind = argv[i] + 7;
+            if (std::strcmp(kind, "streams")   == 0) return StreamsDemo::kStreams;
+            if (std::strcmp(kind, "hyperq")    == 0) return StreamsDemo::kHyperQ;
+            if (std::strcmp(kind, "multicopy") == 0) return StreamsDemo::kMultiCopy;
+        }
+    }
+    return StreamsDemo::kAuto;
+}
+
+int select_device(int argc, char **argv) {
+    return findHggcDevice(argc, const_cast<const char **>(argv));
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path A : streams - compute + memcpy fan-out
+ * ============================================================ */
+
+/// Repeatedly accumulate `*factor` into the slot owned by each thread.
+__global__ void accumulate_factor(int *dst_data, const int *factor_ptr, int repeat_inner) {
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    int       acc  = dst_data[slot];
+    const int step = *factor_ptr;
+    for (int i = 0; i < repeat_inner; ++i) {
+        acc += step;
+    }
+    dst_data[slot] = acc;
+}
+
+namespace {
+
+bool verify_constant(const int *buf, int element_count, int expected) {
+    for (int i = 0; i < element_count; ++i) {
+        if (buf[i] != expected) {
+            std::printf("    mismatch @ %d: got %d expected %d\n", i, buf[i], expected);
+            return false;
+        }
+    }
+    return true;
+}
+
+int run_streams(int argc, char **argv) {
+    const int dev_id = select_device(argc, argv);
+    int       device_total = 0;
+    checkHggcErrors(hggcGetDeviceCount(&device_total));
+    if (device_total == 0) {
+        std::printf(" -> mode=streams | no HGGC device, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+    if (dev_id >= device_total) {
+        std::printf(" -> mode=streams | invalid device id %d (max %d).\n", dev_id, device_total - 1);
+        return EXIT_FAILURE;
+    }
+
+    checkHggcErrors(hggcSetDevice(dev_id));
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+
+    /// Default to BlockingSync to keep CPU usage modest while the PPU works.
+    const int sync_flags = hggcDeviceBlockingSync;
+    checkHggcErrors(hggcSetDeviceFlags(sync_flags));
+
+    /// Down-scale the workload on tiny devices to keep the demo bounded.
+    const float scale = MAX(32.0f / (ppuCoresPerUnit(dev_prop.major, dev_prop.minor)
+                                     * static_cast<float>(dev_prop.multiProcessorCount)),
+                            1.0f);
+    const int element_count = static_cast<int>((16 * 1024 * 1024) / scale);
+    const int byte_count    = element_count * sizeof(int);
+    const int stream_count  = 4;
+    const int rep_count     = 100;
+    const int inner_iters   = 5;
+    const int seed_value    = 5;
+
+    std::printf(" -> mode=streams | device=%s | n=%d | streams=%d\n",
+                dev_prop.name, element_count, stream_count);
+
+    /// Pinned host buffer + device aliases.
+    int *host_buf = nullptr;
+    int *dev_data = nullptr;
+    int *dev_seed = nullptr;
+    checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&host_buf), byte_count));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_data), byte_count));
+    checkHggcErrors(hggcMemset(dev_data, 0, byte_count));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_seed), sizeof(int)));
+    checkHggcErrors(hggcMemcpy(dev_seed, &seed_value, sizeof(int), hggcMemcpyHostToDevice));
+
+    std::vector<hggcStream_t> streams(stream_count, nullptr);
+    for (auto &s : streams) checkHggcErrors(hggcStreamCreate(&s));
+
+    hggcEvent_t evt_begin = nullptr;
+    hggcEvent_t evt_end   = nullptr;
+    checkHggcErrors(hggcEventCreateWithFlags(&evt_begin, hggcEventBlockingSync));
+    checkHggcErrors(hggcEventCreateWithFlags(&evt_end,   hggcEventBlockingSync));
+
+    /// Reference: serial kernel + memcpy back-to-back.
+    const dim3 block_dim(512, 1);
+    const dim3 grid_dim(element_count / block_dim.x, 1);
+    checkHggcErrors(hggcEventRecord(evt_begin, 0));
+    for (int rep = 0; rep < rep_count; ++rep) {
+        accumulate_factor<<<grid_dim, block_dim>>>(dev_data, dev_seed, inner_iters);
+        checkHggcErrors(hggcMemcpy(host_buf, dev_data, byte_count, hggcMemcpyDeviceToHost));
+    }
+    checkHggcErrors(hggcEventRecord(evt_end, 0));
+    checkHggcErrors(hggcEventSynchronize(evt_end));
+
+    float serial_ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&serial_ms, evt_begin, evt_end));
+    std::printf("    serial:   %.2f ms\n", serial_ms / rep_count);
+
+    /// Streamed: each stream owns a tile and runs kernel + memcpy concurrently.
+    std::memset(host_buf, 0xFF, byte_count);
+    checkHggcErrors(hggcMemset(dev_data, 0, byte_count));
+    const dim3 tile_grid(element_count / (stream_count * block_dim.x), 1);
+
+    checkHggcErrors(hggcEventRecord(evt_begin, 0));
+    for (int rep = 0; rep < rep_count; ++rep) {
+        for (int s = 0; s < stream_count; ++s) {
+            accumulate_factor<<<tile_grid, block_dim, 0, streams[s]>>>(
+                dev_data + s * (element_count / stream_count), dev_seed, inner_iters);
+        }
+        for (int s = 0; s < stream_count; ++s) {
+            checkHggcErrors(hggcMemcpyAsync(host_buf + s * (element_count / stream_count),
+                                            dev_data + s * (element_count / stream_count),
+                                            byte_count / stream_count,
+                                            hggcMemcpyDeviceToHost,
+                                            streams[s]));
+        }
+    }
+    checkHggcErrors(hggcEventRecord(evt_end, 0));
+    checkHggcErrors(hggcEventSynchronize(evt_end));
+
+    float streamed_ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&streamed_ms, evt_begin, evt_end));
+    std::printf("    streamed: %.2f ms (%d streams)\n", streamed_ms / rep_count, stream_count);
+
+    const int expected = seed_value * rep_count * inner_iters;
+    const bool ok      = verify_constant(host_buf, element_count, expected);
+
+    for (auto &s : streams) checkHggcErrors(hggcStreamDestroy(s));
+    checkHggcErrors(hggcEventDestroy(evt_begin));
+    checkHggcErrors(hggcEventDestroy(evt_end));
+    checkHggcErrors(hggcFree(dev_data));
+    checkHggcErrors(hggcFree(dev_seed));
+    checkHggcErrors(hggcFreeHost(host_buf));
+
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path B : hyper_queue - many concurrent stream pairs
+ * ============================================================ */
+
+namespace {
+
+/// Spin in-kernel until the PPU has consumed `target_ticks` clock cycles.
+__device__ void spin_clocks(clock_t *out_slot, clock_t target_ticks) {
+    const unsigned int origin = static_cast<unsigned int>(clock());
+    clock_t            elapsed = 0;
+    while (elapsed < target_ticks) {
+        const unsigned int now = static_cast<unsigned int>(clock());
+        elapsed = static_cast<clock_t>(now - origin);
+    }
+    out_slot[0] = elapsed;
+}
+
+}  /// anonymous
+
+/// Twin clock-burning kernels: useful for visualising stream dependencies.
+__global__ void spin_alpha(clock_t *out_slot, clock_t target_ticks) { spin_clocks(out_slot, target_ticks); }
+__global__ void spin_beta (clock_t *out_slot, clock_t target_ticks) { spin_clocks(out_slot, target_ticks); }
+
+/// Single-warp reduction over `count` clock samples.
+__global__ void warp_reduce_clocks(clock_t *clocks, int count) {
+    cg::thread_block       block = cg::this_thread_block();
+    __shared__ clock_t     scratch[32];
+
+    clock_t accumulator = 0;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        accumulator += clocks[i];
+    }
+    scratch[threadIdx.x] = accumulator;
+    cg::sync(block);
+
+    for (int span = warpSize / 2; span > 0; span /= 2) {
+        if (threadIdx.x < span) {
+            scratch[threadIdx.x] += scratch[threadIdx.x + span];
+        }
+        cg::sync(block);
+    }
+
+    if (threadIdx.x == 0) {
+        clocks[0] = scratch[0];
+    }
+}
+
+namespace {
+
+int run_hyperq(int argc, char **argv) {
+    const int dev_id = select_device(argc, argv);
+    checkHggcErrors(hggcSetDevice(dev_id));
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+
+    int stream_count = 32;
+    if (hasArg(argc, const_cast<const char **>(argv), "nstreams")) {
+        stream_count = getArgInt(argc, const_cast<const char **>(argv), "nstreams");
+    }
+    const float kernel_ms = 10.0f;
+    std::printf(" -> mode=hyperq | streams=%d | per-kernel target=%.1f ms\n", stream_count, kernel_ms);
+
+    if (dev_prop.concurrentKernels == 0) {
+        std::printf("    device cannot launch concurrent kernels; runs will serialize.\n");
+    }
+
+    /// Allocate one slot per kernel + a host buffer to read the reduced clocks.
+    clock_t *host_total = nullptr;
+    clock_t *dev_slots  = nullptr;
+    checkHggcErrors(hggcMallocHost(reinterpret_cast<void **>(&host_total), sizeof(clock_t)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_slots), 2 * stream_count * sizeof(clock_t)));
+
+    std::vector<hggcStream_t> streams(stream_count, nullptr);
+    for (auto &s : streams) checkHggcErrors(hggcStreamCreate(&s));
+
+    hggcEvent_t evt_begin = nullptr;
+    hggcEvent_t evt_end   = nullptr;
+    checkHggcErrors(hggcEventCreate(&evt_begin));
+    checkHggcErrors(hggcEventCreate(&evt_end));
+
+    int dev_clockRate = 0;
+    checkHggcErrors(hggcDeviceGetAttribute(&dev_clockRate, hggcDevAttrClockRate, dev_id));
+#if defined(__arm__) || defined(__aarch64__)
+    const clock_t target_ticks = static_cast<clock_t>(kernel_ms * (dev_clockRate / 100));
+#else
+    const clock_t target_ticks = static_cast<clock_t>(kernel_ms * dev_clockRate);
+#endif
+
+    clock_t expected_total = 0;
+    checkHggcErrors(hggcEventRecord(evt_begin, 0));
+    for (int s = 0; s < stream_count; ++s) {
+        spin_alpha<<<1, 1, 0, streams[s]>>>(&dev_slots[2 * s + 0], target_ticks);
+        spin_beta <<<1, 1, 0, streams[s]>>>(&dev_slots[2 * s + 1], target_ticks);
+        expected_total += 2 * target_ticks;
+    }
+    checkHggcErrors(hggcEventRecord(evt_end, 0));
+
+    /// Reduce the per-kernel slots and read them back.
+    warp_reduce_clocks<<<1, 32>>>(dev_slots, 2 * stream_count);
+    checkHggcErrors(hggcMemcpy(host_total, dev_slots, sizeof(clock_t), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcEventSynchronize(evt_end));
+
+    float wall_ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&wall_ms, evt_begin, evt_end));
+    std::printf("    serial bound : %.3f s\n",  (stream_count + 1) * kernel_ms / 1000.0f);
+    std::printf("    concurrent   : %.3f s\n",  2 * kernel_ms / 1000.0f);
+    std::printf("    measured     : %.3f s\n",  wall_ms / 1000.0f);
+
+    const bool ok = (host_total[0] >= expected_total);
+
+    for (auto &s : streams) hggcStreamDestroy(s);
+    hggcEventDestroy(evt_begin);
+    hggcEventDestroy(evt_end);
+    hggcFreeHost(host_total);
+    hggcFree(dev_slots);
+
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path C : multi_copy - pipelined upload / compute / download
+ * ============================================================ */
+
+/// Increment kernel; repeated `inner_repeat` times to bias the timeline.
+__global__ void increment_repeated(int *dst, const int *src, int element_count, int inner_repeat) {
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < element_count) {
+        int v = src[slot];
+        for (int r = 0; r < inner_repeat; ++r) {
+            v = v + 1;
+        }
+        dst[slot] = v;
+    }
+}
+
+namespace {
+
+struct PipelineSlot {
+    int          *host_in   = nullptr;
+    int          *host_out  = nullptr;
+    int          *dev_in    = nullptr;
+    int          *dev_out   = nullptr;
+    hggcStream_t  stream    = nullptr;
+    hggcEvent_t   cycle_end = nullptr;
+};
+
+float pipeline_walk(std::vector<PipelineSlot> &slots,
+                    int active_streams,
+                    int rep_count,
+                    int element_count,
+                    int byte_count,
+                    int inner_repeat,
+                    const dim3 &block_dim,
+                    const dim3 &grid_dim,
+                    hggcEvent_t evt_begin,
+                    hggcEvent_t evt_end) {
+    int current = 0;
+    hggcEventRecord(evt_begin, 0);
+    for (int rep = 0; rep < rep_count; ++rep) {
+        const int next = (current + 1) % active_streams;
+        hggcEventSynchronize(slots[next].cycle_end);
+
+        increment_repeated<<<grid_dim, block_dim, 0, slots[current].stream>>>(
+            slots[current].dev_out, slots[current].dev_in, element_count, inner_repeat);
+
+        checkHggcErrors(hggcMemcpyAsync(slots[next].dev_in, slots[next].host_in,
+                                        byte_count, hggcMemcpyHostToDevice,
+                                        slots[next].stream));
+        checkHggcErrors(hggcMemcpyAsync(slots[current].host_out, slots[current].dev_out,
+                                        byte_count, hggcMemcpyDeviceToHost,
+                                        slots[current].stream));
+        checkHggcErrors(hggcEventRecord(slots[current].cycle_end, slots[current].stream));
+        current = next;
+    }
+    hggcEventRecord(evt_end, 0);
+    hggcDeviceSynchronize();
+
+    float ms = 0.0f;
+    hggcEventElapsedTime(&ms, evt_begin, evt_end);
+    return ms;
+}
+
+int run_multicopy(int argc, char **argv) {
+    int dev_id = 0;
+    if (hasArg(argc, const_cast<const char **>(argv), "device")) {
+        dev_id = getArgInt(argc, const_cast<const char **>(argv), "device=");
+        if (dev_id < 0) {
+            std::printf(" -> mode=multicopy | invalid --device value, waiving.\n");
+            return EXIT_FAILURE;
+        }
+    } else {
+        dev_id = ppuGetMaxPerfDeviceId();
+    }
+    checkHggcErrors(hggcSetDevice(dev_id));
+
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+    const float scale = MAX(32.0f / (ppuCoresPerUnit(dev_prop.major, dev_prop.minor)
+                                     * static_cast<float>(dev_prop.multiProcessorCount)),
+                            1.0f);
+
+    constexpr int stream_count  = 4;
+    const int     element_count = static_cast<int>((1 << 22) / scale);
+    const int     byte_count    = element_count * sizeof(int);
+    const int     rep_count     = 10;
+    const int     inner_repeat  = 5;
+    const dim3    block_dim(512);
+    dim3          grid_dim;
+    grid_dim.x = (element_count / block_dim.x) % 65535;
+    grid_dim.y = ((element_count / block_dim.x) / 65535) + 1;
+
+    std::printf(" -> mode=multicopy | device=%s | n=%d | streams=%d\n",
+                dev_prop.name, element_count, stream_count);
+
+    std::vector<int>          host_seed(element_count, 0);
+    std::vector<PipelineSlot> slots(stream_count);
+    for (auto &slot : slots) {
+        checkHggcErrors(hggcHostAlloc(reinterpret_cast<void **>(&slot.host_in),  byte_count, hggcHostAllocDefault));
+        checkHggcErrors(hggcHostAlloc(reinterpret_cast<void **>(&slot.host_out), byte_count, hggcHostAllocDefault));
+        std::memcpy(slot.host_in, host_seed.data(), byte_count);
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&slot.dev_in),  byte_count));
+        checkHggcErrors(hggcMemset(slot.dev_in, 0, byte_count));
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&slot.dev_out), byte_count));
+        checkHggcErrors(hggcStreamCreate(&slot.stream));
+        checkHggcErrors(hggcEventCreate(&slot.cycle_end));
+        hggcEventRecord(slot.cycle_end, slot.stream);
+    }
+
+    hggcEvent_t evt_begin = nullptr;
+    hggcEvent_t evt_end   = nullptr;
+    hggcEventCreate(&evt_begin);
+    hggcEventCreate(&evt_end);
+
+    /// Warm-up.
+    increment_repeated<<<grid_dim, block_dim>>>(slots[0].dev_out, slots[0].dev_in, element_count, inner_repeat);
+
+    const float serial_ms  = pipeline_walk(slots, 1,            rep_count, element_count,
+                                           byte_count, inner_repeat, block_dim, grid_dim,
+                                           evt_begin, evt_end);
+    const float overlap_ms = pipeline_walk(slots, stream_count, rep_count, element_count,
+                                           byte_count, inner_repeat, block_dim, grid_dim,
+                                           evt_begin, evt_end);
+    std::printf("    serialized: %.2f ms / iter\n", serial_ms  / rep_count);
+    std::printf("    overlapped: %.2f ms / iter (%d streams)\n", overlap_ms / rep_count, stream_count);
+
+    bool ok = true;
+    for (const auto &slot : slots) {
+        for (int i = 0; i < element_count && ok; ++i) {
+            if (slot.host_out[i] != inner_repeat) ok = false;
+        }
+    }
+
+    for (auto &slot : slots) {
+        hggcFreeHost(slot.host_in);
+        hggcFreeHost(slot.host_out);
+        hggcFree(slot.dev_in);
+        hggcFree(slot.dev_out);
+        hggcStreamDestroy(slot.stream);
+        hggcEventDestroy(slot.cycle_end);
+    }
+    hggcEventDestroy(evt_begin);
+    hggcEventDestroy(evt_end);
+
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+StreamsDemo resolve_demo(StreamsDemo requested) {
+    return (requested == StreamsDemo::kAuto) ? StreamsDemo::kStreams : requested;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Entry point
+ * ============================================================ */
+
+int main(int argc, char **argv) {
+    if (hasArg(argc, const_cast<const char **>(argv), "help")) {
+        std::printf("Usage: streams_concurrency [OPTIONS]\n");
+        std::printf("  --mode=streams|hyperq|multicopy   Pick a stream-concurrency demo (default streams).\n");
+        std::printf("  --nstreams=<int>                  hyperq only: stream-pair count.\n");
+        std::printf("  --device=<idx>                    multicopy only: select HGGC device.\n");
+        return EXIT_SUCCESS;
+    }
+
+    const StreamsDemo requested = parse_mode(argc, argv);
+    const StreamsDemo active    = resolve_demo(requested);
+
+    int rc = EXIT_FAILURE;
+    switch (active) {
+        case StreamsDemo::kHyperQ:    rc = run_hyperq(argc, argv);     break;
+        case StreamsDemo::kMultiCopy: rc = run_multicopy(argc, argv);  break;
+        case StreamsDemo::kStreams:
+        default:                      rc = run_streams(argc, argv);    break;
+    }
+
+    if (rc == EXIT_SUCCESS)        std::printf("[streams_concurrency] passed\n");
+    else if (rc == EXIT_SKIPPED)    std::printf("[streams_concurrency] waived\n");
+    else                           std::printf("[streams_concurrency] failed\n");
+
+    return rc;
+}

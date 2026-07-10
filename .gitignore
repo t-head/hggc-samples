@@ -1,0 +1,14 @@
+build
+.vs
+.vscode
+.clangd
+test
+settings.json
+launch.json
+.qoder
+encode_output/
+*.pyc
+__pycache__/
+*.o
+*.a
+*.so

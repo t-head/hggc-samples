@@ -1,0 +1,2 @@
+add_subdirectory(device_query)
+add_subdirectory(topology_query)

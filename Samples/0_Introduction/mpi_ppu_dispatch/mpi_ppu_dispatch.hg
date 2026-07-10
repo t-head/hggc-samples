@@ -1,0 +1,92 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * mpi_ppu_dispatch.hg -- PPU kernel for 1D temperature gradient
+ *
+ * Computes central-difference gradient: out[i] = (in[i+1] - in[i-1]) / 2
+ * Boundary elements use forward/backward difference.
+ */
+
+#include <cstdlib>
+#include <iostream>
+
+#include "mpi_ppu_dispatch.h"
+
+#define HG_CHECK(call)                                                          \
+    do {                                                                        \
+        if ((call) != hggcSuccess) {                                            \
+            hggcError_t status = hggcGetLastError();                            \
+            std::cerr << "HGGC error: \"" #call "\" code " << status << std::endl; \
+            abort_mpi(status);                                                  \
+        }                                                                       \
+    } while (0)
+
+/* ── Device kernel: central difference gradient ────────────── */
+
+__global__ void gradient_kernel(const float *input, float *output, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    if (idx == 0) {
+        /* Forward difference at left boundary */
+        output[0] = input[1] - input[0];
+    } else if (idx == n - 1) {
+        /* Backward difference at right boundary */
+        output[n - 1] = input[n - 1] - input[n - 2];
+    } else {
+        /* Central difference: (T[i+1] - T[i-1]) / 2 */
+        output[idx] = (input[idx + 1] - input[idx - 1]) * 0.5f;
+    }
+}
+
+/* ── Host-side functions ───────────────────────────────────── */
+
+void init_temperatures(float *data, int n)
+{
+    /* Linear temperature gradient with random perturbation */
+    std::srand(42);
+    for (int i = 0; i < n; i++) {
+        float base = static_cast<float>(i) / n * 100.0f;  /* 0..100 C */
+        float noise = static_cast<float>(std::rand()) / RAND_MAX * 5.0f - 2.5f;
+        data[i] = base + noise;
+    }
+}
+
+void compute_gradient(float *host_data, int block_size, int grid_size)
+{
+    int n = block_size * grid_size;
+
+    float *dev_in  = nullptr;
+    float *dev_out = nullptr;
+    HG_CHECK(hggcMalloc(reinterpret_cast<void **>(&dev_in),  n * sizeof(float)));
+    HG_CHECK(hggcMalloc(reinterpret_cast<void **>(&dev_out), n * sizeof(float)));
+
+    HG_CHECK(hggcMemcpy(dev_in, host_data, n * sizeof(float), hggcMemcpyHostToDevice));
+
+    gradient_kernel<<<grid_size, block_size>>>(dev_in, dev_out, n);
+
+    HG_CHECK(hggcMemcpy(host_data, dev_out, n * sizeof(float), hggcMemcpyDeviceToHost));
+
+    HG_CHECK(hggcFree(dev_in));
+    HG_CHECK(hggcFree(dev_out));
+}
+
+void report_stats(float *data, int n, float *out_min, float *out_max, float *out_mean)
+{
+    float mn = data[0], mx = data[0], sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        if (data[i] < mn) mn = data[i];
+        if (data[i] > mx) mx = data[i];
+        sum += data[i];
+    }
+    *out_min  = mn;
+    *out_max  = mx;
+    *out_mean = sum / n;
+}

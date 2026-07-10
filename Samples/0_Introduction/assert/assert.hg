@@ -1,0 +1,162 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * assert — Device-side assert as an invariant checker (Runtime API)
+ *
+ * Demonstrates using assert() in device code to verify kernel outputs.
+ * A running-maximum kernel produces a monotonically non-decreasing array;
+ * a validation kernel asserts this property per element-pair.
+ *
+ * Two scenarios are exercised:
+ *   1. Correct output  → assert does not fire  → PASS
+ *   2. Corrupted output → assert fires          → host detects hggcErrorAssert
+ */
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int kN         = 1024;
+constexpr int kBlockSize = 256;
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────
+// Kernels
+// ─────────────────────────────────────────────────────────────────────
+
+/// Compute running maximum: out[i] = max(in[0..i]).
+/// Each thread processes a contiguous chunk.
+__global__ void prefix_max_kernel(
+    const float * __restrict__ input,
+    float       * __restrict__ output,
+    int n)
+{
+    const int tid   = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = gridDim.x * blockDim.x;
+
+    const int chunk = (n + total - 1) / total;
+    const int start = tid * chunk;
+    const int end   = (start + chunk < n) ? (start + chunk) : n;
+
+    if (start >= n) return;
+
+    float running = input[start];
+    output[start] = running;
+    for (int i = start + 1; i < end; ++i) {
+        if (input[i] > running) running = input[i];
+        output[i] = running;
+    }
+}
+
+/// Assert monotonicity: array[i] <= array[i+1].
+/// Each thread checks one pair.
+__global__ void validate_monotonic_kernel(
+    const float * __restrict__ array,
+    int n)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n - 1) return;
+    assert(array[tid] <= array[tid + 1]);
+}
+
+/// Intentionally break one element to trigger assertion.
+__global__ void corrupt_kernel(float *array, int idx, float bad_val)
+{
+    if (threadIdx.x == 0) {
+        array[idx] = bad_val;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Host
+// ─────────────────────────────────────────────────────────────────────
+
+int main(int argc, char **argv)
+{
+    printf("[assert] Device-side invariant checker\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    const size_t bytes = sizeof(float) * kN;
+
+    // Prepare input: pseudo-random values in [0, 100).
+    float *h_input = static_cast<float *>(malloc(bytes));
+    for (int i = 0; i < kN; ++i) {
+        h_input[i] = static_cast<float>((i * 7 + 13) % 100);
+    }
+
+    float *d_input  = nullptr;
+    float *d_output = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input),  bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output), bytes));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, bytes, hggcMemcpyHostToDevice));
+
+    const dim3 block(kBlockSize);
+    const dim3 grid((kN + kBlockSize - 1) / kBlockSize);
+
+    // ---- Scenario 1: correct computation, assert should NOT fire ----
+    printf("  Scenario 1: valid prefix-max output\n");
+    // Launch with 1 thread for a correct sequential prefix-max.
+    prefix_max_kernel<<<1, 1>>>(d_input, d_output, kN);
+    getLastHggcError("prefix_max_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    validate_monotonic_kernel<<<grid, block>>>(d_output, kN);
+    getLastHggcError("validate_monotonic_kernel failed");
+    hggcError_t status1 = hggcDeviceSynchronize();
+
+    if (status1 == hggcSuccess) {
+        printf("    -> No assertion fired (PASS)\n\n");
+    } else {
+        printf("    -> Unexpected error: %s\n\n", hggcGetErrorString(status1));
+    }
+
+    // ---- Scenario 2: corrupt one element, assert SHOULD fire ----
+    printf("  Scenario 2: corrupted output (expect assert)\n");
+
+    // Write a very small value in the middle to break monotonicity.
+    corrupt_kernel<<<1, 1>>>(d_output, kN / 2, -999.0f);
+    getLastHggcError("corrupt_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    printf("    Launching validation kernel...\n");
+    printf("\n-- Begin assert output\n\n");
+    validate_monotonic_kernel<<<grid, block>>>(d_output, kN);
+    getLastHggcError("validate_monotonic_kernel (corrupt) failed");
+    hggcError_t status2 = hggcDeviceSynchronize();
+    printf("\n-- End assert output\n\n");
+
+    bool pass = false;
+    if (status2 == hggcErrorAssert) {
+        printf("    -> Device assert fired as expected (PASS)\n");
+        pass = true;
+        // Clear the sticky error so subsequent API calls do not fail.
+        hggcGetLastError();
+    } else {
+        printf("    -> Expected hggcErrorAssert but got: %s (FAIL)\n",
+               hggcGetErrorString(status2));
+    }
+
+    // Cleanup. If the device assert fired the context is tainted;
+    // reset the device instead of calling individual hggcFree operations.
+    free(h_input);
+    if (pass) {
+        hggcDeviceReset();
+    } else {
+        checkHggcErrors(hggcFree(d_input));
+        checkHggcErrors(hggcFree(d_output));
+    }
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

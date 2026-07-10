@@ -1,0 +1,2 @@
+add_executable(hggc_graphs_perf_scaling hggc_graph_perf_scaling.hg)
+target_include_directories(hggc_graphs_perf_scaling PRIVATE ${COMMON_DIR})

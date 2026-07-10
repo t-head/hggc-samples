@@ -1,0 +1,56 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#ifndef GEMM_KERNEL_HG_
+#define GEMM_KERNEL_HG_
+
+template <int kTile, typename IndexType>
+__device__ void gemm_bias_impl(
+    float *C, const float *A, const float *B,
+    IndexType wA, IndexType wB, float alpha, float beta)
+{
+    IndexType bx = blockIdx.x, by = blockIdx.y;
+    IndexType tx = threadIdx.x, ty = threadIdx.y;
+
+    float acc = 0.0f;
+
+    for (IndexType phase = 0; phase < wA; phase += kTile) {
+        __shared__ float sA[kTile][kTile];
+        __shared__ float sB[kTile][kTile];
+
+        sA[ty][tx] = A[(by * kTile + ty) * wA + phase + tx];
+        sB[ty][tx] = B[(phase + ty) * wB + bx * kTile + tx];
+        __syncthreads();
+
+        for (IndexType k = 0; k < kTile; k++)
+            acc += sA[ty][k] * sB[k][tx];
+        __syncthreads();
+    }
+
+    IndexType row = by * kTile + ty;
+    IndexType col = bx * kTile + tx;
+    C[row * wB + col] = alpha * acc + beta * C[row * wB + col];
+}
+
+extern "C" __global__ void gemm_bias_bs8(
+    float *C, const float *A, const float *B,
+    size_t wA, size_t wB, float alpha, float beta)
+{ gemm_bias_impl<8, size_t>(C, A, B, wA, wB, alpha, beta); }
+
+extern "C" __global__ void gemm_bias_bs16(
+    float *C, const float *A, const float *B,
+    size_t wA, size_t wB, float alpha, float beta)
+{ gemm_bias_impl<16, size_t>(C, A, B, wA, wB, alpha, beta); }
+
+extern "C" __global__ void gemm_bias_bs32(
+    float *C, const float *A, const float *B,
+    size_t wA, size_t wB, float alpha, float beta)
+{ gemm_bias_impl<32, size_t>(C, A, B, wA, wB, alpha, beta); }
+
+#endif

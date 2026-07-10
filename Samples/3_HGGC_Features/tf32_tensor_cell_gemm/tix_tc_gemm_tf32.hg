@@ -1,0 +1,307 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * tix_tc_gemm_tf32 -- TF32 GEMM via TIX Tensor Cell Instructions (Double-Buffer)
+ *
+ * Same pipeline as bf16_tensor_cell_gemm but with TF32 precision:
+ *   - MMA shape: m16n16k8 (K=8 per MMA, vs K=16 for bf16)
+ *   - A/B: tf32 (4 bytes each, stored in .b32 registers)
+ *   - C/D: f32 (same as bf16 version)
+ *
+ * Core TIX instructions:
+ *   - ppu.cp.async.cg.shared.global       : async global -> shared
+ *   - ppu.tc01.ldmatrix.sync.aligned      : shared -> register fragment load
+ *   - ppu.tc01.mma.sync.aligned.m16n16k8.row.col.f32.tf32.tf32.f32 : MMA
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+
+constexpr int M_GLOBAL = 256;
+constexpr int N_GLOBAL = 256;
+constexpr int K_GLOBAL = 256;
+
+// MMA tile: m16n16k8 for tf32
+constexpr int TILE_M = 16;
+constexpr int TILE_N = 16;
+constexpr int TILE_K = 8;   // K=8 for tf32 (vs 16 for bf16)
+
+constexpr int WARP_SIZE = 32;
+constexpr int kBlockSize = 32;
+
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: TF32 Tensor Cell GEMM with double-buffer pipeline
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void tix_tc_gemm_tf32_kernel(
+    const float * __restrict__ A,   // M x K, row-major (tf32 stored as f32)
+    const float * __restrict__ B,   // K x N, row-major
+    float       * __restrict__ D,   // M x N, row-major
+    int M, int N, int K)
+{
+    // Double-buffer shared memory
+    __shared__ float smem_a[2][TILE_M * TILE_K];  // 2 * 512B
+    __shared__ float smem_b[2][TILE_K * TILE_N];  // 2 * 512B
+
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+    const int lane = threadIdx.x;
+
+    const int num_k_tiles = K / TILE_K;
+
+    // Accumulator: 8 x f32 (same C/D layout as bf16)
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    float c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+
+    // Fragment registers (persist across scopes)
+    unsigned int a0, a1, a2, a3;
+    unsigned int b0, b1, b2, b3;
+
+    const float *a_base = A + tile_row * TILE_M * K;
+    const float *b_base = B + tile_col * TILE_N;
+
+    // ---- Address conversion helper ----
+    #define CVTA_TO_SHARED(smem_addr, ptr) \
+        asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(smem_addr) : "l"(ptr))
+
+    // ---- Async copy helper ----
+    // A tile: 16 rows * 8 cols * 4B = 512B, 32 threads * 16B = 512B
+    //   row_in_tile = lane/2 (16 rows, 2 threads per row)
+    //   col_half = (lane%2)*4 (2 groups of 4 floats per row)
+    // B tile: 8 rows * 16 cols * 4B = 512B, 32 threads * 16B = 512B
+    //   row_in_tile = lane/4 (8 rows, 4 threads per row)
+    //   col_quarter = (lane%4)*4 (4 groups of 4 floats per row)
+    #define ASYNC_COPY_TILE(buf_idx, k_tile_idx) do { \
+        int a_row = lane / 2; \
+        int a_col = (lane % 2) * 4; \
+        int b_row = lane / 4; \
+        int b_col = (lane % 4) * 4; \
+        const float *ga = a_base + a_row * K + (k_tile_idx) * TILE_K + a_col; \
+        const float *gb = b_base + ((k_tile_idx) * TILE_K + b_row) * N + b_col; \
+        unsigned int sa, sb; \
+        CVTA_TO_SHARED(sa, &smem_a[buf_idx][lane * 4]); \
+        CVTA_TO_SHARED(sb, &smem_b[buf_idx][lane * 4]); \
+        asm volatile("ppu.cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(ga)); \
+        asm volatile("ppu.cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sb), "l"(gb)); \
+        asm volatile("ppu.cp.async.commit_group;"); \
+    } while(0)
+
+    // ---- Fragment load helpers ----
+    // A fragment: 16x8 tf32, split into 2x2 sub-matrices of 8x4
+    //   r_blk = lane/4 (M-dim), c_blk = lane%4 (K-dim)
+    //   a0=A[r_blk][c_blk], a1=A[r_blk][4+c_blk]
+    //   a2=A[8+r_blk][c_blk], a3=A[8+r_blk][4+c_blk]
+    #define LOAD_A_FRAG(buf_idx) do { \
+        int r_blk = lane / 4; \
+        int c_blk = lane % 4; \
+        unsigned int base_addr; \
+        CVTA_TO_SHARED(base_addr, &smem_a[buf_idx][0]); \
+        unsigned int a_addr0 = base_addr + (r_blk * TILE_K + c_blk) * 4; \
+        unsigned int a_addr1 = base_addr + (r_blk * TILE_K + 4 + c_blk) * 4; \
+        unsigned int a_addr2 = base_addr + ((8 + r_blk) * TILE_K + c_blk) * 4; \
+        unsigned int a_addr3 = base_addr + ((8 + r_blk) * TILE_K + 4 + c_blk) * 4; \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(a0) : "r"(a_addr0)); \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(a1) : "r"(a_addr1)); \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(a2) : "r"(a_addr2)); \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(a3) : "r"(a_addr3)); \
+    } while(0)
+
+    // B fragment: 8x16 tf32 (.col), split into 2x2 sub-matrices of 4x8
+    //   r_blk = lane/4 (N-dim), c_blk = lane%4 (K-dim)
+    //   b0=B[c_blk][r_blk], b1=B[4+c_blk][r_blk]
+    //   b2=B[c_blk][8+r_blk], b3=B[4+c_blk][8+r_blk]
+    #define LOAD_B_FRAG(buf_idx) do { \
+        int r_blk = lane / 4; \
+        int c_blk = lane % 4; \
+        unsigned int base_addr; \
+        CVTA_TO_SHARED(base_addr, &smem_b[buf_idx][0]); \
+        unsigned int b_addr0 = base_addr + (c_blk * TILE_N + r_blk) * 4; \
+        unsigned int b_addr1 = base_addr + ((4 + c_blk) * TILE_N + r_blk) * 4; \
+        unsigned int b_addr2 = base_addr + (c_blk * TILE_N + 8 + r_blk) * 4; \
+        unsigned int b_addr3 = base_addr + ((4 + c_blk) * TILE_N + 8 + r_blk) * 4; \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(b0) : "r"(b_addr0)); \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(b1) : "r"(b_addr1)); \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(b2) : "r"(b_addr2)); \
+        asm volatile("ppu.ld.shared.b32 %0, [%1];" : "=r"(b3) : "r"(b_addr3)); \
+    } while(0)
+
+    // ---- MMA helper ----
+    #define DO_MMA() \
+        asm volatile( \
+            "ppu.tc01.mma.sync.aligned.m16n16k8.row.col.f32.tf32.tf32.f32 " \
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, " \
+            "{%8,%9,%10,%11}, " \
+            "{%12,%13,%14,%15}, " \
+            "{%0,%1,%2,%3,%4,%5,%6,%7};" \
+            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3), \
+              "+f"(c4), "+f"(c5), "+f"(c6), "+f"(c7) \
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), \
+              "r"(b0), "r"(b1), "r"(b2), "r"(b3))
+
+    // ---- Prologue: prefetch first K-tile into buffer 0 ----
+    ASYNC_COPY_TILE(0, 0);
+
+    // ---- Main loop: double-buffer pipeline ----
+    for (int ki = 1; ki < num_k_tiles; ++ki) {
+        int cur = (ki - 1) & 1;
+        int nxt = ki & 1;
+
+        // Prefetch next K-tile into buffer[nxt]
+        ASYNC_COPY_TILE(nxt, ki);
+
+        // Wait for current buffer to be ready
+        asm volatile("ppu.cp.async.wait_group 1;");
+        __syncthreads();
+
+        // Load fragments and compute
+        LOAD_A_FRAG(cur);
+        LOAD_B_FRAG(cur);
+        DO_MMA();
+
+        __syncthreads();
+    }
+
+    // ---- Epilogue: process last K-tile ----
+    {
+        int cur = (num_k_tiles - 1) & 1;
+        asm volatile("ppu.cp.async.wait_group 0;");
+        __syncthreads();
+
+        LOAD_A_FRAG(cur);
+        LOAD_B_FRAG(cur);
+        DO_MMA();
+    }
+
+    // ---- Store: C/D layout is same as bf16 (8 sub-matrices of 8x4) ----
+    float *d_base = D + tile_row * TILE_M * N + tile_col * TILE_N;
+    const int r_blk = lane / 4;
+    const int c_blk = lane % 4;
+
+    d_base[(r_blk) * N + (c_blk + 0)]      = c0;
+    d_base[(r_blk) * N + (c_blk + 4)]      = c1;
+    d_base[(r_blk) * N + (c_blk + 8)]      = c2;
+    d_base[(r_blk) * N + (c_blk + 12)]     = c3;
+    d_base[(8 + r_blk) * N + (c_blk + 0)]  = c4;
+    d_base[(8 + r_blk) * N + (c_blk + 4)]  = c5;
+    d_base[(8 + r_blk) * N + (c_blk + 8)]  = c6;
+    d_base[(8 + r_blk) * N + (c_blk + 12)] = c7;
+
+    #undef ASYNC_COPY_TILE
+    #undef LOAD_A_FRAG
+    #undef LOAD_B_FRAG
+    #undef DO_MMA
+    #undef CVTA_TO_SHARED
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CPU reference (with TF32 truncation to match hardware precision)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Truncate float to TF32 precision (10-bit mantissa)
+// TF32 keeps sign(1) + exponent(8) + mantissa(10), zeroing lower 13 bits
+static inline float float_to_tf32(float x)
+{
+    unsigned int bits;
+    memcpy(&bits, &x, 4);
+    // Clear lower 13 mantissa bits (23 - 10 = 13)
+    bits &= 0xFFFFE000u;
+    memcpy(&x, &bits, 4);
+    return x;
+}
+
+static void gemm_cpu_ref(float *D, const float *A, const float *B, int M, int N, int K)
+{
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j) {
+            float sum = 0.f;
+            for (int k = 0; k < K; ++k)
+                sum += float_to_tf32(A[i * K + k]) * float_to_tf32(B[k * N + j]);
+            D[i * N + j] = sum;
+        }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[tix_tc_gemm_tf32] TF32 GEMM via TIX Tensor Cell (m16n16k8)\n\n");
+    printf("  D = A * B,  A[%d x %d],  B[%d x %d],  D[%d x %d]  (all f32/tf32)\n\n",
+           M_GLOBAL, K_GLOBAL, K_GLOBAL, N_GLOBAL, M_GLOBAL, N_GLOBAL);
+
+    findHggcDevice(argc, (const char **)argv);
+
+    const size_t mat_bytes = M_GLOBAL * K_GLOBAL * sizeof(float);
+    const size_t d_bytes   = M_GLOBAL * N_GLOBAL * sizeof(float);
+
+    float *h_A = (float *)malloc(mat_bytes);
+    float *h_B = (float *)malloc(mat_bytes);
+    float *h_D_ppu = (float *)malloc(d_bytes);
+    float *h_D_ref = (float *)malloc(d_bytes);
+
+    // Random inputs to avoid fake pass
+    srand((unsigned)time(NULL));
+    for (int i = 0; i < M_GLOBAL * K_GLOBAL; ++i)
+        h_A[i] = ((float)(rand() % 200) - 100) * 0.01f;
+    for (int i = 0; i < K_GLOBAL * N_GLOBAL; ++i)
+        h_B[i] = ((float)(rand() % 200) - 100) * 0.01f;
+
+    float *d_A, *d_B, *d_D;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_A), mat_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_B), mat_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_D), d_bytes));
+    checkHggcErrors(hggcMemcpy(d_A, h_A, mat_bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_B, h_B, mat_bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemset(d_D, 0, d_bytes));
+
+    dim3 grid(N_GLOBAL / TILE_N, M_GLOBAL / TILE_M);
+    dim3 block(kBlockSize);
+
+    HggcTimer timer;
+    timer.start();
+    tix_tc_gemm_tf32_kernel<<<grid, block>>>(d_A, d_B, d_D, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+    getLastHggcError("tix_tc_gemm_tf32_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    printf("  PPU kernel time: %.3f ms\n", timer.elapsed());
+
+    checkHggcErrors(hggcMemcpy(h_D_ppu, d_D, d_bytes, hggcMemcpyDeviceToHost));
+
+    gemm_cpu_ref(h_D_ref, h_A, h_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+
+    // TF32: golden uses tf32 truncation; residual error from accumulation order
+    float max_rel = 0.0f, max_abs = 0.0f;
+    for (int i = 0; i < M_GLOBAL * N_GLOBAL; ++i) {
+        float diff = fabsf(h_D_ppu[i] - h_D_ref[i]);
+        float scale = fmaxf(fabsf(h_D_ref[i]), 0.1f);  // avoid near-zero amplification
+        max_rel = fmaxf(max_rel, diff / scale);
+        max_abs = fmaxf(max_abs, diff);
+    }
+    bool pass = (max_rel < 0.01f);
+    printf("  Max absolute error: %e\n", max_abs);
+    printf("  Max relative error: %e\n", max_rel);
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+
+    free(h_A); free(h_B); free(h_D_ppu); free(h_D_ref);
+    checkHggcErrors(hggcFree(d_A));
+    checkHggcErrors(hggcFree(d_B));
+    checkHggcErrors(hggcFree(d_D));
+
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

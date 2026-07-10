@@ -1,0 +1,167 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * graph_perf_scaling.hg -- HGGC Graph API Performance Scaling
+ *
+ * Measures how Graph capture, instantiation, and launch times scale
+ * with graph topology size. Builds parallel-chain graphs of increasing
+ * complexity via stream capture, then benchmarks each phase.
+ */
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+/* ── Configuration ─────────────────────────────────────────── */
+
+constexpr int kWidth = 2;       // parallel streams in graph
+constexpr int kLaunchIters = 50; // launch repetitions for timing
+static const int kTestLengths[] = {10, 50, 100, 200};
+static const int kNumTests = 4;
+
+/* ── No-op kernel for graph topology ───────────────────────── */
+
+__global__ void noop_kernel() {}
+
+/* ── Timing helpers ────────────────────────────────────────── */
+
+using Clock = std::chrono::high_resolution_clock;
+
+static double elapsed_us(Clock::time_point start, Clock::time_point end)
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1e-3;
+}
+
+/* ── Build graph via stream capture ────────────────────────── */
+
+static hggcGraph_t build_graph(int length, int width,
+                                std::vector<hggcStream_t> &streams,
+                                hggcEvent_t sync_event)
+{
+    hggcGraph_t graph;
+    checkHggcErrors(hggcStreamBeginCapture(streams[0], hggcStreamCaptureModeGlobal));
+
+    /* Fork: stream 0 signals all other streams */
+    checkHggcErrors(hggcEventRecord(sync_event, streams[0]));
+    for (int i = 1; i < width; i++)
+        checkHggcErrors(hggcStreamWaitEvent(streams[i], sync_event));
+
+    /* Each stream launches 'length' no-op kernels */
+    for (int i = 0; i < width; i++)
+        for (int j = 0; j < length; j++)
+            noop_kernel<<<1, 1, 0, streams[i]>>>();
+
+    /* Join: all streams signal back to stream 0 */
+    for (int i = 1; i < width; i++) {
+        checkHggcErrors(hggcEventRecord(sync_event, streams[i]));
+        checkHggcErrors(hggcStreamWaitEvent(streams[0], sync_event));
+    }
+
+    checkHggcErrors(hggcStreamEndCapture(streams[0], &graph));
+    return graph;
+}
+
+/* ── Benchmark one graph size ──────────────────────────────── */
+
+static void bench_graph(int length, int width,
+                         std::vector<hggcStream_t> &streams,
+                         hggcEvent_t sync_event)
+{
+    int total_nodes = width * length + width * 2;  // approximate
+
+    /* Capture */
+    auto cap_start = Clock::now();
+    hggcGraph_t graph = build_graph(length, width, streams, sync_event);
+    auto cap_end = Clock::now();
+    double cap_us = elapsed_us(cap_start, cap_end);
+
+    /* Instantiate */
+    hggcGraphExec_t exec;
+    auto inst_start = Clock::now();
+    checkHggcErrors(hggcGraphInstantiateWithFlags(&exec, graph, 0));
+    auto inst_end = Clock::now();
+    double inst_us = elapsed_us(inst_start, inst_end);
+
+    /* First launch (includes upload) */
+    auto first_start = Clock::now();
+    checkHggcErrors(hggcGraphLaunch(exec, streams[0]));
+    checkHggcErrors(hggcStreamSynchronize(streams[0]));
+    auto first_end = Clock::now();
+    double first_us = elapsed_us(first_start, first_end);
+
+    /* Repeated launches (graph already uploaded) */
+    auto rep_start = Clock::now();
+    for (int i = 0; i < kLaunchIters; i++) {
+        checkHggcErrors(hggcGraphLaunch(exec, streams[0]));
+    }
+    checkHggcErrors(hggcStreamSynchronize(streams[0]));
+    auto rep_end = Clock::now();
+    double rep_total_us = elapsed_us(rep_start, rep_end);
+    double rep_avg_us = rep_total_us / kLaunchIters;
+
+    /* Output */
+    printf("  %4d        %4d      %8.1f     %8.1f     %8.1f     %8.1f\n",
+           length, total_nodes, cap_us, inst_us, first_us, rep_avg_us);
+
+    /* Cleanup */
+    checkHggcErrors(hggcGraphExecDestroy(exec));
+    checkHggcErrors(hggcGraphDestroy(graph));
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[graph_perf_scaling] HGGC Graph API Performance Scaling\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    int width = kWidth;
+    if (argc > 1) width = atoi(argv[1]);
+
+    printf("  Parallel streams: %d\n", width);
+    printf("  Launch iterations: %d\n\n", kLaunchIters);
+
+    /* Setup streams and events */
+    int num_streams = (width == 1) ? 2 : width;
+    std::vector<hggcStream_t> streams(num_streams);
+    for (int i = 0; i < num_streams; i++)
+        checkHggcErrors(hggcStreamCreate(&streams[i]));
+
+    hggcEvent_t sync_event;
+    checkHggcErrors(hggcEventCreate(&sync_event, hggcEventDisableTiming));
+
+    /* Warmup */
+    noop_kernel<<<1, 1, 0, streams[0]>>>();
+    checkHggcErrors(hggcStreamSynchronize(streams[0]));
+
+    /* Print table header */
+    printf("  %-8s  %-8s  %-10s  %-10s  %-10s  %-10s\n",
+           "Length", "Nodes", "Capture", "Instantiate", "FirstLaunch", "AvgRepeat");
+    printf("  %-8s  %-8s  %-10s  %-10s  %-10s  %-10s\n",
+           "------", "-----", "-------", "-----------", "-----------", "----------");
+
+    /* Run benchmarks */
+    for (int t = 0; t < kNumTests; t++)
+        bench_graph(kTestLengths[t], width, streams, sync_event);
+
+    printf("\n  Result: PASS\n");
+
+    /* Cleanup */
+    checkHggcErrors(hggcEventDestroy(sync_event));
+    for (int i = 0; i < num_streams; i++)
+        checkHggcErrors(hggcStreamDestroy(streams[i]));
+
+    return EXIT_SUCCESS;
+}

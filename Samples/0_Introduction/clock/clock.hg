@@ -1,0 +1,161 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * clock — Memory coalescing microbenchmark (Runtime API)
+ *
+ * Uses the device-side clock() intrinsic to measure per-block cycle counts
+ * for two memory access patterns: coalesced vs. strided.  The host prints
+ * a comparison showing how coalescing affects throughput.
+ */
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int kNumBlocks   = 32;
+constexpr int kNumThreads  = 256;
+constexpr int kNumIters    = 64;     // iterations per thread inside kernel
+constexpr int kTotalElems  = kNumBlocks * kNumThreads;
+constexpr int kTimerSlots  = kNumBlocks * 2;  // start + end per block
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────
+// Kernels
+// ─────────────────────────────────────────────────────────────────────
+
+/// Coalesced: consecutive threads hit consecutive addresses.
+__global__ void clock_coalesced(
+    const float * __restrict__ input,
+    float       * __restrict__ output,
+    clock_t     *timer,
+    int           num_iters)
+{
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int gid = bid * blockDim.x + tid;
+    const int stride = gridDim.x * blockDim.x;
+
+    if (tid == 0) timer[bid] = clock();
+    __syncthreads();
+
+    float acc = 0.0f;
+    int idx = gid;
+    for (int i = 0; i < num_iters; ++i) {
+        acc += input[idx % stride];
+        idx += stride;
+    }
+
+    output[gid] = acc;
+    __syncthreads();
+    if (tid == 0) timer[bid + gridDim.x] = clock();
+}
+
+/// Strided: neighboring threads hit addresses far apart.
+__global__ void clock_strided(
+    const float * __restrict__ input,
+    float       * __restrict__ output,
+    clock_t     *timer,
+    int           num_iters)
+{
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int gid = bid * blockDim.x + tid;
+    const int base = bid * blockDim.x;
+
+    if (tid == 0) timer[bid] = clock();
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int i = 0; i < num_iters; ++i) {
+        int off = (tid * 32 + i) % (int)blockDim.x;
+        acc += input[base + off];
+    }
+
+    output[gid] = acc;
+    __syncthreads();
+    if (tid == 0) timer[bid + gridDim.x] = clock();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Host
+// ─────────────────────────────────────────────────────────────────────
+
+/// Compute average clocks/block from the timer array.
+static long double compute_avg_clocks(const clock_t *timer, int num_blocks)
+{
+    long double total = 0;
+    for (int i = 0; i < num_blocks; ++i) {
+        total += static_cast<long double>(timer[i + num_blocks] - timer[i]);
+    }
+    return total / num_blocks;
+}
+
+int main(int argc, char **argv)
+{
+    printf("[clock] Memory coalescing microbenchmark\n\n");
+
+    const int dev_id = findHggcDevice(argc, (const char **)argv);
+    (void)dev_id;
+
+    const size_t input_bytes  = sizeof(float)   * kTotalElems;
+    const size_t output_bytes = sizeof(float)   * kTotalElems;
+    const size_t timer_bytes  = sizeof(clock_t) * kTimerSlots;
+
+    // Host-side input: simple deterministic pattern.
+    float *h_input = static_cast<float *>(malloc(input_bytes));
+    for (int i = 0; i < kTotalElems; ++i) {
+        h_input[i] = static_cast<float>(i % 128) * 0.01f;
+    }
+
+    // Device allocations.
+    float   *d_input  = nullptr;
+    float   *d_output = nullptr;
+    clock_t *d_timer  = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input),  input_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output), output_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_timer),  timer_bytes));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, input_bytes, hggcMemcpyHostToDevice));
+
+    clock_t *h_timer = static_cast<clock_t *>(malloc(timer_bytes));
+
+    // ---- Coalesced pass ----
+    clock_coalesced<<<kNumBlocks, kNumThreads>>>(d_input, d_output, d_timer, kNumIters);
+    getLastHggcError("clock_coalesced launch failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    checkHggcErrors(hggcMemcpy(h_timer, d_timer, timer_bytes, hggcMemcpyDeviceToHost));
+
+    const long double avg_coalesced = compute_avg_clocks(h_timer, kNumBlocks);
+
+    // ---- Strided pass ----
+    clock_strided<<<kNumBlocks, kNumThreads>>>(d_input, d_output, d_timer, kNumIters);
+    getLastHggcError("clock_strided launch failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    checkHggcErrors(hggcMemcpy(h_timer, d_timer, timer_bytes, hggcMemcpyDeviceToHost));
+
+    const long double avg_strided = compute_avg_clocks(h_timer, kNumBlocks);
+
+    // ---- Report ----
+    printf("  Coalesced : %.0Lf clocks/block\n", avg_coalesced);
+    printf("  Strided   : %.0Lf clocks/block\n", avg_strided);
+    printf("  Ratio     : %.2Lfx slower\n", avg_strided / avg_coalesced);
+    printf("\n  %s\n", (avg_strided > avg_coalesced) ? "Result = PASS (strided is slower as expected)"
+                                                      : "Result = UNEXPECTED (coalesced not faster)");
+
+    // Cleanup.
+    free(h_input);
+    free(h_timer);
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_output));
+    checkHggcErrors(hggcFree(d_timer));
+
+    return EXIT_SUCCESS;
+}

@@ -1,0 +1,165 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * smem_bank_conflict.hg -- Shared Memory Bank Conflict Impact Analysis
+ *
+ * Measures shared memory read throughput with different access strides
+ * to show how bank conflicts degrade performance. PPU shared memory
+ * has 32 banks (4 bytes each). Accessing the same bank from multiple
+ * threads in the same warp causes serialization.
+ *
+ * Tests strides 1 (no conflict) through 32 (maximum conflict), reporting
+ * effective throughput (GB/s) for each pattern.
+ */
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+/* ── Configuration ─────────────────────────────────────────── */
+
+constexpr int kBankCount   = 32;    // PPU shared memory banks
+constexpr int kBlockSize   = 256;   // threads per block
+constexpr int kWarpsPerBlk = kBlockSize / 32;
+constexpr int kIters       = 1000;
+constexpr int kSmemFloats  = kBlockSize * kBankCount;  // 8192 floats = 32KB
+
+static const int kTestStrides[] = {1, 2, 4, 8, 16, 32};
+static const int kNumTests = 6;
+
+/* ── Device kernel: strided shared memory read ─────────────── */
+/*
+ * Each thread reads kReads floats from shared memory with a given stride.
+ * stride=1: consecutive banks, no conflict
+ * stride=2: every other bank, half the threads hit same bank
+ * stride=32: all threads hit the same bank (maximum conflict)
+ */
+
+constexpr int kReads = 256;  // reads per thread
+
+__global__ void smem_read_kernel(float *output, int stride)
+{
+    __shared__ float smem[kSmemFloats];
+
+    int tid = threadIdx.x;
+
+    /* Initialize shared memory */
+    for (int i = tid; i < kSmemFloats; i += kBlockSize)
+        smem[i] = static_cast<float>(i);
+
+    __syncthreads();
+
+    /* Read with stride pattern — stride multiplies tid to create bank conflicts.
+     * stride=1: consecutive addresses, no conflict
+     * stride=2: every other bank, threads 0 and 16 share bank
+     * stride=32: all threads in warp hit same bank (max conflict) */
+    float sum = 0.0f;
+    for (int i = 0; i < kReads; i++) {
+        int idx = (tid * stride + i) % kSmemFloats;
+        sum += smem[idx];
+    }
+
+    /* Prevent compiler from optimizing away the reads */
+    if (sum < -1e30f)
+        output[tid] = sum;
+    else
+        output[tid] = sum;
+}
+
+/* ── Benchmark helper ──────────────────────────────────────── */
+
+static double bench_stride(float *d_out, int stride)
+{
+    /* Warmup */
+    smem_read_kernel<<<1, kBlockSize>>>(d_out, stride);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    hggcEvent_t t0, t1;
+    checkHggcErrors(hggcEventCreate(&t0));
+    checkHggcErrors(hggcEventCreate(&t1));
+    checkHggcErrors(hggcEventRecord(t0));
+    for (int i = 0; i < kIters; i++)
+        smem_read_kernel<<<1, kBlockSize>>>(d_out, stride);
+    checkHggcErrors(hggcEventRecord(t1));
+    checkHggcErrors(hggcEventSynchronize(t1));
+
+    float ms = 0;
+    checkHggcErrors(hggcEventElapsedTime(&ms, t0, t1));
+    checkHggcErrors(hggcEventDestroy(t0));
+    checkHggcErrors(hggcEventDestroy(t1));
+
+    double ms_per = ms / kIters;
+    /* Throughput: each thread reads kReads floats = 4 bytes each */
+    double bytes = (double)kBlockSize * kReads * sizeof(float);
+    return bytes / (ms_per * 1e-3 * 1e9);
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[smem_bank_conflict] Shared Memory Bank Conflict Impact\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    printf("  Block: %d threads (%d warps)\n", kBlockSize, kWarpsPerBlk);
+    printf("  Shared memory: %d floats (%d KB)\n", kSmemFloats, kSmemFloats * 4 / 1024);
+    printf("  Reads/thread: %d\n", kIters == 1000 ? kReads : kReads);
+    printf("  Iterations: %d\n\n", kIters);
+
+    float *d_out = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out),
+                                kBlockSize * sizeof(float)));
+
+    /* Print table header */
+    printf("  %-8s  %-12s  %-12s  %s\n", "Stride", "Pattern", "Throughput", "Efficiency");
+    printf("  %-8s  %-12s  %-12s  %s\n", "------", "-------", "----------", "----------");
+
+    double baseline = 0;
+    bool all_ok = true;
+
+    for (int t = 0; t < kNumTests; t++) {
+        int stride = kTestStrides[t];
+        double gbps = bench_stride(d_out, stride);
+
+        if (t == 0) baseline = gbps;
+        double eff = (baseline > 0) ? (gbps / baseline * 100.0) : 0.0;
+
+        const char *pattern;
+        if (stride == 1) pattern = "no conflict";
+        else if (stride <= 4) pattern = "minor conflict";
+        else if (stride <= 16) pattern = "moderate conflict";
+        else pattern = "max conflict";
+
+        printf("  %8d  %-12s  %8.2f GB/s  %6.1f%%\n",
+               stride, pattern, gbps, eff);
+
+        /* Verify kernel ran correctly (output should be non-zero) */
+        float h_val;
+        checkHggcErrors(hggcMemcpy(&h_val, d_out, sizeof(float),
+                                    hggcMemcpyDeviceToHost));
+        if (h_val == 0.0f) {
+            printf("  WARNING: zero output detected\n");
+            all_ok = false;
+        }
+    }
+
+    printf("\n  Baseline (stride=1): %.2f GB/s\n", baseline);
+    printf("  Max conflict (stride=32): %.2f GB/s\n",
+           bench_stride(d_out, 32));  // re-run for display only
+    printf("  Result: %s\n", all_ok ? "PASS" : "FAIL");
+
+    checkHggcErrors(hggcFree(d_out));
+    return all_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}

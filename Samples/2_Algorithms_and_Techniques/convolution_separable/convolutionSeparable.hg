@@ -1,0 +1,147 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * convolutionSeparable.hg — Row and column convolution kernels
+ *
+ * Strategy:
+ *   - Each block loads a horizontal (or vertical) tile of TILE_W pixels
+ *     plus KERNEL_RADIUS halo on each side into shared memory.
+ *   - TILE_H rows (or columns) are processed per block in the
+ *     perpendicular direction to increase occupancy.
+ *   - The 1-D kernel weights reside in __constant__ memory for broadcast.
+ */
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+
+#include "convolutionSeparable_common.h"
+
+// ---- Constant memory for the 1-D kernel weights ----
+__constant__ float c_kernel[KERNEL_LENGTH];
+
+extern "C" void upload_kernel_weights(const float *h_kernel)
+{
+    hggcMemcpyToSymbol(c_kernel, h_kernel, KERNEL_LENGTH * sizeof(float));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Row-wise 1-D convolution
+// ═══════════════════════════════════════════════════════════════════════
+// Block: (TILE_W, TILE_H).  Each thread loads one main pixel + participates
+// in cooperative halo loading.
+
+__global__ void row_conv_kernel(
+    float       * __restrict__ dst,
+    const float * __restrict__ src,
+    int width, int height)
+{
+    // Shared tile: TILE_W output pixels + KERNEL_RADIUS halo on each side.
+    constexpr int SMEM_W = TILE_W + 2 * KERNEL_RADIUS;
+    __shared__ float smem[TILE_H][SMEM_W];
+
+    const int tx = threadIdx.x;  // [0, TILE_W)
+    const int ty = threadIdx.y;  // [0, TILE_H)
+
+    // Global pixel coordinate for this thread's output.
+    const int gx = blockIdx.x * TILE_W + tx;
+    const int gy = blockIdx.y * TILE_H + ty;
+
+    if (gy >= height) return;
+
+    // Load main region: each thread loads its own pixel.
+    const int row_offset = gy * width;
+    smem[ty][tx + KERNEL_RADIUS] = (gx < width) ? src[row_offset + gx] : 0.0f;
+
+    // Cooperative halo loading (left and right).
+    // Left halo: first KERNEL_RADIUS threads in x load left border.
+    if (tx < KERNEL_RADIUS) {
+        int hx = gx - KERNEL_RADIUS;
+        smem[ty][tx] = (hx >= 0) ? src[row_offset + hx] : 0.0f;
+    }
+    // Right halo: last KERNEL_RADIUS threads load right border.
+    if (tx >= TILE_W - KERNEL_RADIUS) {
+        int hx = gx + KERNEL_RADIUS;
+        smem[ty][tx + 2 * KERNEL_RADIUS] = (hx < width) ? src[row_offset + hx] : 0.0f;
+    }
+
+    __syncthreads();
+
+    // Compute the convolution for this pixel.
+    if (gx >= width) return;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = -KERNEL_RADIUS; k <= KERNEL_RADIUS; ++k) {
+        sum += c_kernel[KERNEL_RADIUS + k] * smem[ty][tx + KERNEL_RADIUS + k];
+    }
+    dst[row_offset + gx] = sum;
+}
+
+extern "C" void convolution_row_ppu(float *d_dst, const float *d_src, int w, int h)
+{
+    dim3 block(TILE_W, TILE_H);
+    dim3 grid((w + TILE_W - 1) / TILE_W, (h + TILE_H - 1) / TILE_H);
+    row_conv_kernel<<<grid, block>>>(d_dst, d_src, w, h);
+    getLastHggcError("row_conv_kernel failed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Column-wise 1-D convolution
+// ═══════════════════════════════════════════════════════════════════════
+// Block: (TILE_H, TILE_W).  Transposed layout so consecutive threads access
+// consecutive columns for coalesced memory reads along the vertical strip.
+
+__global__ void col_conv_kernel(
+    float       * __restrict__ dst,
+    const float * __restrict__ src,
+    int width, int height)
+{
+    constexpr int SMEM_H = TILE_W + 2 * KERNEL_RADIUS;
+    __shared__ float smem[TILE_H][SMEM_H];
+
+    const int tx = threadIdx.x;  // perpendicular (column index within tile)
+    const int ty = threadIdx.y;  // filter direction (row index within tile)
+
+    const int gx = blockIdx.x * TILE_H + tx;
+    const int gy = blockIdx.y * TILE_W + ty;
+
+    if (gx >= width) return;
+
+    // Load main region.
+    smem[tx][ty + KERNEL_RADIUS] = (gy < height) ? src[gy * width + gx] : 0.0f;
+
+    // Top halo.
+    if (ty < KERNEL_RADIUS) {
+        int hy = gy - KERNEL_RADIUS;
+        smem[tx][ty] = (hy >= 0) ? src[hy * width + gx] : 0.0f;
+    }
+    // Bottom halo.
+    if (ty >= TILE_W - KERNEL_RADIUS) {
+        int hy = gy + KERNEL_RADIUS;
+        smem[tx][ty + 2 * KERNEL_RADIUS] = (hy < height) ? src[hy * width + gx] : 0.0f;
+    }
+
+    __syncthreads();
+
+    if (gy >= height) return;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = -KERNEL_RADIUS; k <= KERNEL_RADIUS; ++k) {
+        sum += c_kernel[KERNEL_RADIUS + k] * smem[tx][ty + KERNEL_RADIUS + k];
+    }
+    dst[gy * width + gx] = sum;
+}
+
+extern "C" void convolution_col_ppu(float *d_dst, const float *d_src, int w, int h)
+{
+    dim3 block(TILE_H, TILE_W);
+    dim3 grid((w + TILE_H - 1) / TILE_H, (h + TILE_W - 1) / TILE_W);
+    col_conv_kernel<<<grid, block>>>(d_dst, d_src, w, h);
+    getLastHggcError("col_conv_kernel failed");
+}

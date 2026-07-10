@@ -1,0 +1,5 @@
+{
+    "multi_device_collab": {
+        "min_ppus": 2
+    }
+}

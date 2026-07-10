@@ -1,0 +1,2 @@
+add_executable(multi_device_collab multi_device_collab.hg)
+target_include_directories(multi_device_collab PRIVATE ${COMMON_DIR})

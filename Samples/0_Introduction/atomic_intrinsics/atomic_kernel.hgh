@@ -1,0 +1,34 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#pragma once
+
+/// Layout of the per-thread atomic targets inside the output buffer.
+enum AtomicSlot : int {
+    kSlotAnd = 0,
+    kSlotOr,
+    kSlotXor,
+    kSlotAdd,
+    kSlotSub,
+    kSlotExch,
+    kSlotMax,
+    kSlotMin,
+    kSlotInc,
+    kSlotDec,
+    kSlotCas,
+    kAtomicSlotCount
+};
+
+/// Modulus used by the wrapping increment.
+#define ATOMIC_INC_LIMIT 17u
+/// Threshold used by the wrapping decrement.
+#define ATOMIC_DEC_LIMIT 137u
+
+/// Bitwise pre-seed value placed into AND/XOR slots before kernel launch.
+#define ATOMIC_BITWISE_SEED 0xff

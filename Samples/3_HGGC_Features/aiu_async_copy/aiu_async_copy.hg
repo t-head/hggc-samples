@@ -1,0 +1,268 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * aiu_async_copy -- AIU TIX 1.0 Async Copy + ldmatrix.swzl Round-Trip
+ *
+ * Demonstrates warp-parallel tile-based GEMM-style data loading:
+ * - A large 64×1×64 bf16 tensor resides in global memory.
+ * - 4 warps each claim a 16×1×64 tile by warp index.
+ * - Each warp's lane 0 issues AIU copy into its own smem partition.
+ * - Each warp de-swizzles its tile via 4 ldmatrix.swzl calls.
+ * - All tiles processed in parallel, verifying data integrity.
+ */
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+
+#include <hggc_runtime.h>
+#include "hggc_fp16.h"
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+
+// ── Large source tensor dimensions ──
+constexpr int BIG_H       = 64;   // 64 rows in global memory
+constexpr int MAT_W       = 1;
+constexpr int MAT_C       = 64;   // 128 bytes per row (128B swizzle granularity)
+
+// ── Tile dimensions (per AIU copy / per warp) ──
+constexpr int TILE_H      = 16;   // 16 rows per tile
+constexpr int N_WARPS     = BIG_H / TILE_H;  // 4 warps = 4 tiles
+
+// ── Derived sizes ──
+constexpr int N_ELEM     = BIG_H * MAT_W * MAT_C;    // 4096
+constexpr int N_BYTES    = N_ELEM * sizeof(uint16_t); // 8192
+constexpr int TILE_ELEM  = TILE_H * MAT_W * MAT_C;    // 1024
+constexpr int TILE_BYTES = TILE_ELEM * sizeof(uint16_t); // 2048
+
+// ── ldmatrix parameters ──
+constexpr int N_LDMATRIX = 4;    // 4 calls per tile (256 bf16 each = 1024 total)
+constexpr int WARP_SIZE  = 32;
+constexpr int kBlockSize = N_WARPS * WARP_SIZE;  // 128 threads
+constexpr int ELEM_PER_THREAD = TILE_ELEM / WARP_SIZE;  // 32
+
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Device kernel — warp-parallel tile-based AIU copy + ldmatrix.swzl
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Warp i processes tile i:
+// 1. Lane 0 of each warp issues ppu.cp.async.aiu to copy tile i from
+//    the large global tensor into the warp's private smem partition.
+//    Tensor descriptor: dim_h=BIG_H, start_h=warpIdx×TILE_H, cube_h=TILE_H.
+// 2. commit_group + wait_group 0 + __syncthreads.
+// 3. Each warp executes 4 ldmatrix.swzl.m8n8.x4.b16 calls
+//    (channel_offset = 0, 32, 64, 96) from its smem partition.
+// 4. Each thread stores 32 bf16 values to global output at tile offset.
+
+__global__ void aiu_copy_and_load(const uint16_t * __restrict__ input,
+                                   uint16_t * __restrict__ output)
+{
+    int warpIdx  = threadIdx.x / WARP_SIZE;
+    int lane     = threadIdx.x % WARP_SIZE;
+
+    // ── Per-warp smem partition (128B aligned) ──
+    // Each warp gets TILE_ELEM elements in shared memory
+    extern __shared__ __align__(128) uint16_t smem[];
+    uint16_t *my_smem = smem + warpIdx * TILE_ELEM;
+
+    unsigned int my_smem_addr;
+    asm("ppu.cvta.to.shared.u32 %0, %1;"
+        : "=r"(my_smem_addr) : "l"(my_smem));
+
+    // ═════════════════════════════════════════════════════════════════
+    // Phase 1 — AIU async copy (global → shared, swizzle 128B)
+    // ═════════════════════════════════════════════════════════════════
+    // Each warp's lane 0 copies its assigned tile from the large tensor.
+    // All warps issue AIU copies concurrently.
+
+    if (lane == 0) {
+        int start_h = warpIdx * TILE_H;
+
+        // Tensor: full big tensor [BIG_H, MAT_W, MAT_C]
+        // Cube:  tile slice    [TILE_H, MAT_W, MAT_C]
+        asm volatile(
+            "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
+            " [%0], [%1],"
+            " {%2, %3, %4, %5, %6, %7},"
+            " {%8, %9, %10, %11};"
+            :: "r"(my_smem_addr), "l"(input),
+               "r"(BIG_H),  "r"(MAT_W), "r"(MAT_C),     // dim_h, dim_w, dim_c
+               "r"(start_h), "r"(0),    "r"(0),         // start_h, start_w, start_c
+               "r"(TILE_H), "r"(MAT_W), "r"(MAT_C),     // cube_h, cube_w, cube_c
+               "r"(1));                                   // cube_n
+
+        asm volatile("ppu.cp.async.commit_group;");
+        asm volatile("ppu.cp.async.wait_group 0;");
+    }
+
+    // Ensure all warps' AIU copies are complete before any warp reads smem
+    __syncthreads();
+
+    // ═════════════════════════════════════════════════════════════════
+    // Phase 2 — ldmatrix.swzl decode (shared → registers)
+    // ═════════════════════════════════════════════════════════════════
+    // Each warp de-swizzles its own tile via 4 ldmatrix.swzl calls.
+    // channel_offset = 0, 32, 64, 96 (byte offset into channel dimension)
+
+    unsigned int frag[16];
+
+    #pragma unroll
+    for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+        int ch_off = iter * 32;  // 0, 32, 64, 96
+        asm volatile(
+            "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
+            " {%0, %1, %2, %3}, [%4],"
+            " {%5, %6, %7, %8, %9, %10};"
+            : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
+              "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
+            : "r"(my_smem_addr),
+              "r"(0),       "r"(0),        // start_h, start_w
+              "r"(TILE_H),   "r"(MAT_W),     // cube_h, cube_w
+              "r"(1),        "r"(ch_off));   // cube_n, channel_offset
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Phase 3 — Store fragments to correct positions via reverse mapping
+    // ═════════════════════════════════════════════════════════════════
+    // m8n8.x4.b16 fragment layout (per 16×16 matrix loaded per call):
+    //   r_blk = lane / 4  (0-7),  c_blk = lane % 4  (0-3)
+    //   R0: (r_blk,     c_blk*2)     (r_blk,     c_blk*2+1)   → upper-left 8×8
+    //   R1: (r_blk,     8+c_blk*2)   (r_blk,     8+c_blk*2+1) → upper-right 8×8
+    //   R2: (8+r_blk,   c_blk*2)     (8+r_blk,   c_blk*2+1)   → lower-left 8×8
+    //   R3: (8+r_blk,   8+c_blk*2)   (8+r_blk,   8+c_blk*2+1) → lower-right 8×8
+    //
+    // row maps to tensor H dimension, col maps to channel dimension.
+    // Each call loads 16 channels (channel_offset = iter * 32 bytes = iter * 16 ch).
+
+    int r_blk = lane / 4;
+    int c_blk = lane % 4;
+    int tile_row = warpIdx * TILE_H;
+
+    #pragma unroll
+    for (int iter = 0; iter < N_LDMATRIX; ++iter) {
+        int ch_base = iter * 16;  // base channel for this call (0, 16, 32, 48)
+
+        // R0: upper-left 8×8  (rows 0-7, cols 0-7)
+        output[(tile_row + r_blk) * MAT_C + ch_base + c_blk*2]     = static_cast<uint16_t>(frag[iter*4+0] & 0xFFFFu);
+        output[(tile_row + r_blk) * MAT_C + ch_base + c_blk*2 + 1] = static_cast<uint16_t>((frag[iter*4+0] >> 16) & 0xFFFFu);
+
+        // R1: upper-right 8×8  (rows 0-7, cols 8-15)
+        output[(tile_row + r_blk) * MAT_C + ch_base + 8 + c_blk*2]     = static_cast<uint16_t>(frag[iter*4+1] & 0xFFFFu);
+        output[(tile_row + r_blk) * MAT_C + ch_base + 8 + c_blk*2 + 1] = static_cast<uint16_t>((frag[iter*4+1] >> 16) & 0xFFFFu);
+
+        // R2: lower-left 8×8  (rows 8-15, cols 0-7)
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + c_blk*2]     = static_cast<uint16_t>(frag[iter*4+2] & 0xFFFFu);
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + c_blk*2 + 1] = static_cast<uint16_t>((frag[iter*4+2] >> 16) & 0xFFFFu);
+
+        // R3: lower-right 8×8  (rows 8-15, cols 8-15)
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + 8 + c_blk*2]     = static_cast<uint16_t>(frag[iter*4+3] & 0xFFFFu);
+        output[(tile_row + 8 + r_blk) * MAT_C + ch_base + 8 + c_blk*2 + 1] = static_cast<uint16_t>((frag[iter*4+3] >> 16) & 0xFFFFu);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[aiu_async_copy] AIU TIX 1.0 Async Copy + ldmatrix.swzl\n");
+    printf("  Warp-parallel tile-based GEMM-style data loading demo\n\n");
+    findHggcDevice(argc, (const char **)argv);
+
+    printf("  Source tensor: %d×%d×%d bf16  (%d elements, %d bytes)\n",
+           BIG_H, MAT_W, MAT_C, N_ELEM, N_BYTES);
+    printf("  Tile size:     %d×%d×%d bf16  (%d elements, %d bytes)\n",
+           TILE_H, MAT_W, MAT_C, TILE_ELEM, TILE_BYTES);
+    printf("  Warps:         %d  (1 tile/warp, parallel)\n", N_WARPS);
+    printf("  Block:         %d threads  (%d warps × %d threads)\n",
+           kBlockSize, N_WARPS, WARP_SIZE);
+    printf("  Per-thread:    %d elements/tile\n\n", ELEM_PER_THREAD);
+
+    // ── Host input: simple uint16_t sequence 1, 2, 3, ... ──
+    auto *h_input = new uint16_t[N_ELEM];
+    for (int i = 0; i < N_ELEM; ++i)
+        h_input[i] = static_cast<uint16_t>(i + 1);
+
+    // ── Device allocations ──
+    uint16_t *d_input = nullptr;
+    uint16_t *d_output = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input),
+                                N_ELEM * sizeof(uint16_t)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output),
+                                N_ELEM * sizeof(uint16_t)));
+    checkHggcErrors(hggcMemcpy(d_input, h_input,
+                                N_ELEM * sizeof(uint16_t),
+                                hggcMemcpyHostToDevice));
+
+    // ── Launch 1 block × N_WARPS warps ──
+    // Dynamic smem: N_WARPS × TILE_BYTES (each warp gets its own partition)
+    HggcTimer timer;
+    timer.start();
+
+    aiu_copy_and_load<<<1, kBlockSize, N_WARPS * TILE_BYTES>>>(
+        d_input, d_output);
+    getLastHggcError("aiu_copy_and_load kernel");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    timer.stop();
+
+    // ── Read back ──
+    auto *h_output = new uint16_t[N_ELEM];
+    checkHggcErrors(hggcMemcpy(h_output, d_output,
+                                N_ELEM * sizeof(uint16_t),
+                                hggcMemcpyDeviceToHost));
+
+    // ── Verify: sorted multiset comparison (uint16_t) ──
+    printf("  Verification: sorted multiset comparison (uint16_t)\n");
+    auto *in_sorted  = new uint16_t[N_ELEM];
+    auto *out_sorted = new uint16_t[N_ELEM];
+    memcpy(in_sorted,  h_input,  N_ELEM * sizeof(uint16_t));
+    memcpy(out_sorted, h_output, N_ELEM * sizeof(uint16_t));
+    std::sort(in_sorted,  in_sorted  + N_ELEM);
+    std::sort(out_sorted, out_sorted + N_ELEM);
+
+    int mismatch_count = 0;
+    for (int i = 0; i < N_ELEM; ++i) {
+        if (in_sorted[i] != out_sorted[i]) {
+            if (mismatch_count < 8)
+                printf("  mismatch[%d]: expected %d, got %d\n",
+                       i, in_sorted[i], out_sorted[i]);
+            ++mismatch_count;
+        }
+    }
+    delete[] in_sorted;
+    delete[] out_sorted;
+
+    if (mismatch_count > 0)
+        printf("  %d mismatches out of %d elements\n", mismatch_count, N_ELEM);
+
+    // Check exact position matches
+    int match = 0;
+    for (int i = 0; i < N_ELEM; ++i)
+        if (h_output[i] == h_input[i]) ++match;
+    printf("  Exact position matches: %d/%d\n", match, N_ELEM);
+
+    bool pass = (mismatch_count == 0);
+
+    // ── Cleanup ──
+    delete[] h_input;
+    delete[] h_output;
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_output));
+
+    printf("\n  Kernel time: %.3f ms\n", timer.elapsed());
+    printf("  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

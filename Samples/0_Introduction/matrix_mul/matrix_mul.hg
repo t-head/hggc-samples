@@ -1,0 +1,192 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * matrix_mul.hg -- Tiled GEMM with bias (C = alpha*A*B + beta*C)
+ */
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+#include <hggc_profiler_api.h>
+#include <hggc_runtime.h>
+
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+namespace {
+
+constexpr int    kTileSize      = 32;
+constexpr int    kWarmupIters   = 5;
+constexpr int    kTimedIters    = 100;
+constexpr float  kAlpha         = 1.5f;
+constexpr float  kBeta          = 0.5f;
+constexpr double kRelTolerance  = 1.0e-4;
+
+}  // namespace
+
+/* ── Device kernel: tiled GEMM with bias ───────────────────── */
+
+template <int kTile>
+__global__ void gemm_bias_kernel(
+    float *C, const float *A, const float *B,
+    int wA, int wB, float alpha, float beta)
+{
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    float acc = 0.0f;
+
+    for (int phase = 0; phase < wA; phase += kTile) {
+        __shared__ float sA[kTile][kTile];
+        __shared__ float sB[kTile][kTile];
+
+        sA[ty][tx] = A[(by * kTile + ty) * wA + phase + tx];
+        sB[ty][tx] = B[(phase + ty) * wB + bx * kTile + tx];
+        __syncthreads();
+
+        for (int k = 0; k < kTile; k++)
+            acc += sA[ty][k] * sB[k][tx];
+        __syncthreads();
+    }
+
+    int row = by * kTile + ty;
+    int col = bx * kTile + tx;
+    C[row * wB + col] = alpha * acc + beta * C[row * wB + col];
+}
+
+/* ── Host helpers ──────────────────────────────────────────── */
+
+static void random_init(float *data, int n, unsigned seed)
+{
+    std::srand(seed);
+    for (int i = 0; i < n; i++)
+        data[i] = static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f;
+}
+
+static void cpu_gemm_ref(
+    const float *A, const float *B, const float *C_init, float *C_ref,
+    int ha, int wa, int wb, float alpha, float beta)
+{
+    for (int i = 0; i < ha; i++) {
+        for (int j = 0; j < wb; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < wa; k++)
+                sum += A[i * wa + k] * B[k * wb + j];
+            C_ref[i * wb + j] = alpha * sum + beta * C_init[i * wb + j];
+        }
+    }
+}
+
+/* ── Main ──────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    printf("[matrix_mul] Tiled GEMM with Bias (C = alpha*A*B + beta*C)\n\n");
+
+    findHggcDevice(argc, const_cast<const char **>(argv));
+
+    int wA = 4 * kTileSize, hA = 4 * kTileSize;
+    int wB = 6 * kTileSize;
+
+    if (hasArg(argc, const_cast<const char **>(argv), "wA"))
+        wA = getArgInt(argc, const_cast<const char **>(argv), "wA");
+    if (hasArg(argc, const_cast<const char **>(argv), "hA"))
+        hA = getArgInt(argc, const_cast<const char **>(argv), "hA");
+    if (hasArg(argc, const_cast<const char **>(argv), "wB"))
+        wB = getArgInt(argc, const_cast<const char **>(argv), "wB");
+
+    if (wA % kTileSize || hA % kTileSize || wB % kTileSize) {
+        fprintf(stderr, "  Dimensions must be multiples of %d\n", kTileSize);
+        return EXIT_FAILURE;
+    }
+
+    printf("  A(%dx%d) * B(%dx%d) = C(%dx%d)\n", hA, wA, wA, wB, hA, wB);
+    printf("  alpha=%.2f, beta=%.2f, tile=%d\n\n", kAlpha, kBeta, kTileSize);
+
+    size_t n_a = (size_t)hA * wA, n_b = (size_t)wA * wB, n_c = (size_t)hA * wB;
+    size_t bytes_a = n_a * sizeof(float), bytes_b = n_b * sizeof(float);
+    size_t bytes_c = n_c * sizeof(float);
+
+    std::vector<float> h_A(n_a), h_B(n_b), h_C(n_c), h_C_ref(n_c);
+    random_init(h_A.data(), n_a, 42);
+    random_init(h_B.data(), n_b, 123);
+    random_init(h_C.data(), n_c, 456);
+
+    /* CPU reference */
+    cpu_gemm_ref(h_A.data(), h_B.data(), h_C.data(), h_C_ref.data(),
+                 hA, wA, wB, kAlpha, kBeta);
+
+    /* Device buffers */
+    float *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_A), bytes_a));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_B), bytes_b));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_C), bytes_c));
+    checkHggcErrors(hggcMemcpy(d_A, h_A.data(), bytes_a, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_B, h_B.data(), bytes_b, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_C, h_C.data(), bytes_c, hggcMemcpyHostToDevice));
+
+    dim3 block(kTileSize, kTileSize);
+    dim3 grid(wB / kTileSize, hA / kTileSize);
+
+    /* Warmup */
+    for (int i = 0; i < kWarmupIters; i++)
+        gemm_bias_kernel<kTileSize><<<grid, block>>>(d_C, d_A, d_B, wA, wB, kAlpha, kBeta);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    /* Timed runs */
+    hggcEvent_t t0, t1;
+    checkHggcErrors(hggcEventCreate(&t0));
+    checkHggcErrors(hggcEventCreate(&t1));
+    checkHggcErrors(hggcEventRecord(t0));
+    for (int i = 0; i < kTimedIters; i++)
+        gemm_bias_kernel<kTileSize><<<grid, block>>>(d_C, d_A, d_B, wA, wB, kAlpha, kBeta);
+    checkHggcErrors(hggcEventRecord(t1));
+    checkHggcErrors(hggcEventSynchronize(t1));
+
+    float ms = 0.0f;
+    checkHggcErrors(hggcEventElapsedTime(&ms, t0, t1));
+    double ms_per = ms / kTimedIters;
+    double flops = 2.0 * hA * wA * wB;
+    double gflops = flops / (ms_per * 1e6);
+    printf("  Performance: %.2f GFlop/s (%.3f ms/call)\n\n", gflops, ms_per);
+
+    checkHggcErrors(hggcEventDestroy(t0));
+    checkHggcErrors(hggcEventDestroy(t1));
+
+    /* Verify */
+    checkHggcErrors(hggcMemcpy(d_C, h_C.data(), bytes_c, hggcMemcpyHostToDevice));
+    gemm_bias_kernel<kTileSize><<<grid, block>>>(d_C, d_A, d_B, wA, wB, kAlpha, kBeta);
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    checkHggcErrors(hggcMemcpy(h_C.data(), d_C, bytes_c, hggcMemcpyDeviceToHost));
+
+    int mismatches = 0;
+    for (size_t i = 0; i < n_c; i++) {
+        float diff = h_C[i] - h_C_ref[i];
+        if (diff < 0) diff = -diff;
+        float denom = fabsf(h_C_ref[i]);
+        if (denom < 1.0f) denom = 1.0f;
+        if (diff / denom > kRelTolerance) {
+            if (mismatches < 5)
+                printf("  MISMATCH [%zu]: got %.6f, ref %.6f\n", i, h_C[i], h_C_ref[i]);
+            mismatches++;
+        }
+    }
+
+    printf("  Mismatches: %d / %zu\n", mismatches, n_c);
+    printf("  Result: %s\n", mismatches == 0 ? "PASS" : "FAIL");
+
+    checkHggcErrors(hggcFree(d_A));
+    checkHggcErrors(hggcFree(d_B));
+    checkHggcErrors(hggcFree(d_C));
+
+    return mismatches == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}

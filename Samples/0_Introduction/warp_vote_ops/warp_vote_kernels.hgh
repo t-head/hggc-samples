@@ -1,0 +1,49 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#ifndef HGGC_WARP_VOTE_KERNELS_HGH
+#define HGGC_WARP_VOTE_KERNELS_HGH
+
+namespace warp_vote {
+constexpr unsigned int kFullMask = 0xffffffffu;
+}  // namespace warp_vote
+
+/// Per-thread warp-wide ANY: for every lane, write 1 if any active lane in the
+/// warp had a non-zero predicate.
+__global__ void any_vote_kernel(unsigned int *dev_input, unsigned int *dev_result, int element_count)
+{
+    const int tx = threadIdx.x;
+    dev_result[tx] = __any_sync(warp_vote::kFullMask, dev_input[tx]);
+}
+
+/// Per-thread warp-wide ALL: lane writes 1 only if every lane in the warp had a
+/// non-zero predicate.
+__global__ void all_vote_kernel(unsigned int *dev_input, unsigned int *dev_result, int element_count)
+{
+    const int tx = threadIdx.x;
+    dev_result[tx] = __all_sync(warp_vote::kFullMask, dev_input[tx]);
+}
+
+/// Directed multi-warp test that records three boolean observations per lane:
+/// ANY result, raw predicate, and a guarded ALL result.
+__global__ void mixed_vote_kernel(bool *dev_info, int warp_size)
+{
+    const int tx = threadIdx.x;
+    const unsigned int mask = warp_vote::kFullMask;
+    bool *slot = dev_info + (tx * 3);
+
+    slot[0] = __any_sync(mask, (tx >= (warp_size * 3) / 2));
+    slot[1] = (tx >= (warp_size * 3) / 2);
+
+    if (__all_sync(mask, (tx >= (warp_size * 3) / 2))) {
+        slot[2] = true;
+    }
+}
+
+#endif  // HGGC_WARP_VOTE_KERNELS_HGH

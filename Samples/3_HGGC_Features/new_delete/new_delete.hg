@@ -1,0 +1,179 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * new_delete -- Device-Side Linked List with new/delete and Virtual Functions
+ *
+ * Demonstrates C++ dynamic memory and polymorphism on the PPU device:
+ *
+ *   1. Device-side `new` / `delete` for heap allocation
+ *   2. Virtual functions dispatched on device (polymorphic nodes)
+ *   3. Pointer chasing (linked list traversal) on device
+ *   4. hggcDeviceSetLimit to configure device heap size
+ *
+ * Scenario: Build a singly-linked list of polymorphic nodes on the device,
+ * traverse it to compute a result, then free all nodes.
+ *   - DataNode: holds an integer value, contributes to sum
+ *   - DoubleNode: holds a value, contributes 2x to sum (polymorphic behavior)
+ */
+#include <cstdio>
+#include <cstdlib>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int NUM_NODES = 64;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Device-side polymorphic linked list node
+// ═══════════════════════════════════════════════════════════════════════
+
+struct Node {
+    Node *next;
+    int   value;
+
+    __device__ Node(int v) : next(nullptr), value(v) {}
+    __device__ virtual ~Node() {}
+
+    // Virtual: how much this node contributes to the sum
+    __device__ virtual int contribute() const { return value; }
+};
+
+// Derived: contributes 2x its value
+struct DoubleNode : public Node {
+    __device__ DoubleNode(int v) : Node(v) {}
+    __device__ virtual int contribute() const override { return value * 2; }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+// Build a linked list: even indices get Node, odd indices get DoubleNode
+__global__ void build_list_kernel(Node **head_ptr, int num_nodes)
+{
+    // Single thread builds the list sequentially
+    if (threadIdx.x != 0) return;
+
+    Node *head = nullptr;
+    Node *tail = nullptr;
+
+    for (int i = 0; i < num_nodes; ++i) {
+        Node *node;
+        if (i % 2 == 0) {
+            node = new Node(i + 1);
+        } else {
+            node = new DoubleNode(i + 1);
+        }
+
+        if (head == nullptr) {
+            head = tail = node;
+        } else {
+            tail->next = node;
+            tail = node;
+        }
+    }
+
+    *head_ptr = head;
+}
+
+// Traverse list and sum contributions (exercises virtual dispatch + pointer chasing)
+__global__ void sum_list_kernel(Node **head_ptr, int *result)
+{
+    if (threadIdx.x != 0) return;
+
+    int sum = 0;
+    Node *curr = *head_ptr;
+    while (curr != nullptr) {
+        sum += curr->contribute();  // virtual call!
+        curr = curr->next;
+    }
+    *result = sum;
+}
+
+// Free all nodes in the list
+__global__ void free_list_kernel(Node **head_ptr)
+{
+    if (threadIdx.x != 0) return;
+
+    Node *curr = *head_ptr;
+    while (curr != nullptr) {
+        Node *next = curr->next;
+        delete curr;  // virtual destructor!
+        curr = next;
+    }
+    *head_ptr = nullptr;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[new_delete] Device-Side Linked List (new/delete + virtual)\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    // Set device heap size (needed for device-side new/delete)
+    size_t heap_size = 1024 * 1024;  // 1 MB
+    checkHggcErrors(hggcDeviceSetLimit(hggcLimitMallocHeapSize, heap_size));
+    printf("  Device heap set to %zu bytes\n", heap_size);
+    printf("  Building linked list of %d polymorphic nodes...\n\n", NUM_NODES);
+
+    // Device pointer to list head
+    Node **d_head;
+    int   *d_result;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_head), sizeof(Node *)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_result), sizeof(int)));
+    checkHggcErrors(hggcMemset(d_head, 0, sizeof(Node *)));
+
+    // Build list on device
+    build_list_kernel<<<1, 1>>>(d_head, NUM_NODES);
+    getLastHggcError("build_list_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    // Traverse and sum
+    sum_list_kernel<<<1, 1>>>(d_head, d_result);
+    getLastHggcError("sum_list_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+
+    int h_result;
+    checkHggcErrors(hggcMemcpy(&h_result, d_result, sizeof(int), hggcMemcpyDeviceToHost));
+
+    // CPU reference:
+    // Even indices (0,2,4,...): Node contributes value = i+1
+    // Odd indices (1,3,5,...): DoubleNode contributes 2*(i+1)
+    int expected = 0;
+    for (int i = 0; i < NUM_NODES; ++i) {
+        if (i % 2 == 0)
+            expected += (i + 1);       // Node
+        else
+            expected += 2 * (i + 1);   // DoubleNode
+    }
+
+    printf("  PPU sum (virtual dispatch): %d\n", h_result);
+    printf("  CPU reference:              %d\n", expected);
+
+    bool pass = (h_result == expected);
+
+    // Free list on device
+    free_list_kernel<<<1, 1>>>(d_head);
+    getLastHggcError("free_list_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    printf("  List freed on device.\n");
+
+    checkHggcErrors(hggcFree(d_head));
+    checkHggcErrors(hggcFree(d_result));
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

@@ -1,0 +1,50 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#ifndef HGGC_SHARED_MEM_TRAITS_HGH
+#define HGGC_SHARED_MEM_TRAITS_HGH
+
+/// Primary template — instantiating it triggers a link-time error so callers
+/// must supply an explicit specialization for their element type.
+template <typename T>
+struct DynamicSharedBuffer
+{
+    __device__ T *data()
+    {
+        extern __device__ void hggc_shared_buffer_unsupported_type(void);
+        hggc_shared_buffer_unsupported_type();
+        return nullptr;
+    }
+};
+
+#define HGGC_DEFINE_SHARED_BUFFER(TYPE, TAG)             \
+    template <> struct DynamicSharedBuffer<TYPE>         \
+    {                                                    \
+        __device__ TYPE *data()                          \
+        {                                                \
+            extern __shared__ TYPE shared_##TAG[];       \
+            return shared_##TAG;                         \
+        }                                                \
+    }
+
+HGGC_DEFINE_SHARED_BUFFER(int,            i32);
+HGGC_DEFINE_SHARED_BUFFER(unsigned int,   u32);
+HGGC_DEFINE_SHARED_BUFFER(char,           i8);
+HGGC_DEFINE_SHARED_BUFFER(unsigned char,  u8);
+HGGC_DEFINE_SHARED_BUFFER(short,          i16);
+HGGC_DEFINE_SHARED_BUFFER(unsigned short, u16);
+HGGC_DEFINE_SHARED_BUFFER(long,           ilong);
+HGGC_DEFINE_SHARED_BUFFER(unsigned long,  ulong);
+HGGC_DEFINE_SHARED_BUFFER(bool,           bln);
+HGGC_DEFINE_SHARED_BUFFER(float,          f32);
+HGGC_DEFINE_SHARED_BUFFER(double,         f64);
+
+#undef HGGC_DEFINE_SHARED_BUFFER
+
+#endif  // HGGC_SHARED_MEM_TRAITS_HGH

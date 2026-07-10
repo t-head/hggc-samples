@@ -1,0 +1,325 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * tix_tc_gemm_int8 -- INT8 GEMM via TIX Tensor Cell (Double-Buffer)
+ *
+ * Integer matrix multiply D = A*B (int8 inputs, int32 accumulate)
+ * using ppu.tc01.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32.
+ *
+ * Algorithm: tiled GEMM with double-buffered shared memory staging.
+ *   - Each block computes a 16x16 output tile (one warp per tile)
+ *   - K dimension tiled by 32, double-buffered A/B in shared memory
+ *   - Prologue: prefetch first K-tile into buffer[0]
+ *   - Main loop: prefetch next K-tile into buffer[1-cur], compute with cur
+ *   - Epilogue: compute last K-tile, write results to global memory
+ *
+ * Key differences from bf16/tf32 versions:
+ *   - K-tile = 32 (largest K per MMA instruction)
+ *   - A/B stored as int8 (1 byte per element)
+ *   - A tile: 16x32 = 512 bytes, B tile: 32x16 = 512 bytes
+ *   - B uses ldmatrix.m16n16.x2.diagswap.trans.b8 (requires paired K-half smem)
+ *   - C/D fragments: 8 x .s32 registers (same layout as bf16/tf32)
+ *
+ * Matrix dimensions: M=N=K=256 (configurable via constants)
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <ctime>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int M_GLOBAL = 256;
+constexpr int N_GLOBAL = 256;
+constexpr int K_GLOBAL = 256;
+
+constexpr int TILE_M = 16;
+constexpr int TILE_N = 16;
+constexpr int TILE_K = 32;  // K=32 for int8 MMA
+
+constexpr int WARP_SIZE = 32;
+constexpr int kBlockSize = 32;
+
+// Double-buffer: two K-tiles of A (16x32 int8) and B (32x16 int8) each
+// A tile: 16 rows * 32 cols * 1 byte = 512 bytes
+// B tile: 32 rows * 16 cols * 1 byte = 512 bytes
+// 32 threads * 16 bytes = 512 bytes per tile (perfect fit)
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: Full-TIX double-buffer Tensor Cell INT8 GEMM
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void tix_tc_gemm_int8_kernel(
+    const int8_t * __restrict__ A,  // M x K, row-major
+    const int8_t * __restrict__ B,  // K x N, row-major (B[k*N+n])
+    int32_t      * __restrict__ D,  // M x N, row-major
+    int M, int N, int K)
+{
+    // Double-buffer shared memory for A and B tiles
+    __shared__ int8_t smem_a[2][TILE_M * TILE_K];  // 2 * 512B
+    __shared__ int8_t smem_b[2][TILE_K * TILE_N];  // 2 * 512B
+
+    // Output tile coordinates
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+    const int lane = threadIdx.x;
+
+    const int num_k_tiles = K / TILE_K;
+
+    // Accumulator: 8 x int32 (same C/D layout as bf16/tf32)
+    int32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    int32_t c4 = 0, c5 = 0, c6 = 0, c7 = 0;
+
+    // Fragment registers (must persist across scopes)
+    unsigned int a0, a1, a2, a3;
+    unsigned int b0, b1, b2, b3;
+
+    // Base pointers for this block's A row-strip and B col-strip
+    const int8_t *a_base = A + tile_row * TILE_M * K;
+    const int8_t *b_base = B + tile_col * TILE_N;
+
+    // ---- Helper: convert generic pointer to shared memory address ----
+    #define CVTA_TO_SHARED(smem_addr, ptr) \
+        asm("ppu.cvta.to.shared.u32 %0, %1;" : "=r"(smem_addr) : "l"(ptr))
+
+    // ---- Helper: async copy one K-tile of A and B into smem buffer ----
+    // A: row-major in smem. Thread copies 16 bytes (16 int8 = half a row).
+    //    lane/2 = M-row, (lane%2)*16 = K-column offset
+    // B: paired K-half in smem. Thread copies 16 bytes (one full K-row of N=16).
+    //    k = (lane/2) + (lane%2)*16, so K-rows pair as (0,16),(1,17),...
+    //    smem layout naturally becomes [(k%16)*32 + (k/16)*16 + n]
+    #define ASYNC_COPY_TILE(buf_idx, k_tile_idx) do { \
+        int a_row = lane / 2; \
+        int a_col = (lane % 2) * 16; \
+        const int8_t *ga = a_base + a_row * K + (k_tile_idx) * TILE_K + a_col; \
+        int b_k = (lane / 2) + (lane % 2) * 16; \
+        const int8_t *gb = b_base + ((k_tile_idx) * TILE_K + b_k) * N; \
+        unsigned int sa, sb; \
+        CVTA_TO_SHARED(sa, &smem_a[buf_idx][lane * 16]); \
+        CVTA_TO_SHARED(sb, &smem_b[buf_idx][lane * 16]); \
+        asm volatile("ppu.cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sa), "l"(ga)); \
+        asm volatile("ppu.cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(sb), "l"(gb)); \
+        asm volatile("ppu.cp.async.commit_group;"); \
+    } while(0)
+
+    // ---- Prologue: prefetch first K-tile into buffer 0 ----
+    ASYNC_COPY_TILE(0, 0);
+
+    // ---- Main loop: double-buffer pipeline ----
+    for (int ki = 1; ki < num_k_tiles; ++ki) {
+        int cur = (ki - 1) & 1;
+        int nxt = ki & 1;
+
+        // Prefetch next K-tile into buffer[nxt]
+        ASYNC_COPY_TILE(nxt, ki);
+
+        // Wait for current buffer to be ready
+        asm volatile("ppu.cp.async.wait_group 1;");
+        __syncthreads();
+
+        // Load A fragment: m8n8.x4.b16
+        {
+            int sub = lane / 8;
+            int row_in_sub = lane % 8;
+            int base_row = (sub / 2) * 8 + row_in_sub;
+            int base_col = (sub % 2) * 16;
+            unsigned int addr_a;
+            CVTA_TO_SHARED(addr_a, &smem_a[cur][0]);
+            addr_a += base_row * TILE_K + base_col;
+            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.b16 "
+                         "{%0, %1, %2, %3}, [%4];"
+                         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                         : "r"(addr_a));
+        }
+
+        // Load B fragment: m16n16.x2.diagswap.trans.b8
+        {
+            unsigned int addr_b;
+            CVTA_TO_SHARED(addr_b, &smem_b[cur][0]);
+            addr_b += (lane % 16) * 32 + (lane / 16) * 16;
+            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m16n16.x2.diagswap.trans.shared.b8 "
+                         "{%0, %1, %2, %3}, [%4];"
+                         : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                         : "r"(addr_b));
+        }
+
+        // MMA: m16n16k32 int8
+        asm volatile(
+            "ppu.tc01.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+            "{%8,%9,%10,%11}, "
+            "{%12,%13,%14,%15}, "
+            "{%16,%17,%18,%19,%20,%21,%22,%23};"
+            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
+              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+              "r"(b0), "r"(b1), "r"(b2), "r"(b3),
+              "r"(c0), "r"(c1), "r"(c2), "r"(c3),
+              "r"(c4), "r"(c5), "r"(c6), "r"(c7));
+
+        __syncthreads();
+    }
+
+    // ---- Epilogue: process last K-tile ----
+    {
+        int cur = (num_k_tiles - 1) & 1;
+        asm volatile("ppu.cp.async.wait_group 0;");
+        __syncthreads();
+
+        {
+            int sub = lane / 8;
+            int row_in_sub = lane % 8;
+            int base_row = (sub / 2) * 8 + row_in_sub;
+            int base_col = (sub % 2) * 16;
+            unsigned int addr_a;
+            CVTA_TO_SHARED(addr_a, &smem_a[cur][0]);
+            addr_a += base_row * TILE_K + base_col;
+            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.b16 "
+                         "{%0, %1, %2, %3}, [%4];"
+                         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                         : "r"(addr_a));
+        }
+
+        {
+            unsigned int addr_b;
+            CVTA_TO_SHARED(addr_b, &smem_b[cur][0]);
+            addr_b += (lane % 16) * 32 + (lane / 16) * 16;
+            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m16n16.x2.diagswap.trans.shared.b8 "
+                         "{%0, %1, %2, %3}, [%4];"
+                         : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                         : "r"(addr_b));
+        }
+
+        asm volatile(
+            "ppu.tc01.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+            "{%8,%9,%10,%11}, "
+            "{%12,%13,%14,%15}, "
+            "{%16,%17,%18,%19,%20,%21,%22,%23};"
+            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
+              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+              "r"(b0), "r"(b1), "r"(b2), "r"(b3),
+              "r"(c0), "r"(c1), "r"(c2), "r"(c3),
+              "r"(c4), "r"(c5), "r"(c6), "r"(c7));
+    }
+
+    // ---- Store results to global memory ----
+    // C/D layout same as bf16/tf32 (8 sub-matrices of 8x4)
+    int32_t *d_base = D + tile_row * TILE_M * N + tile_col * TILE_N;
+    const int r_blk = lane / 4;
+    const int c_blk = lane % 4;
+
+    d_base[(r_blk) * N + (c_blk + 0)]      = c0;
+    d_base[(r_blk) * N + (c_blk + 4)]      = c1;
+    d_base[(r_blk) * N + (c_blk + 8)]      = c2;
+    d_base[(r_blk) * N + (c_blk + 12)]     = c3;
+    d_base[(8 + r_blk) * N + (c_blk + 0)]  = c4;
+    d_base[(8 + r_blk) * N + (c_blk + 4)]  = c5;
+    d_base[(8 + r_blk) * N + (c_blk + 8)]  = c6;
+    d_base[(8 + r_blk) * N + (c_blk + 12)] = c7;
+
+    #undef ASYNC_COPY_TILE
+    #undef CVTA_TO_SHARED
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CPU reference
+// ═══════════════════════════════════════════════════════════════════════
+
+static void gemm_int8_cpu(int32_t *D, const int8_t *A, const int8_t *B,
+                          int M, int N, int K)
+{
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j) {
+            int32_t sum = 0;
+            for (int k = 0; k < K; ++k)
+                sum += (int32_t)A[i * K + k] * (int32_t)B[k * N + j];
+            D[i * N + j] = sum;
+        }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════════
+
+int main(int argc, char **argv)
+{
+    printf("[tix_tc_gemm_int8] INT8 GEMM via TIX Tensor Cell (Double-Buffer)\n\n");
+    printf("  D = A * B,  A[%d x %d] s8,  B[%d x %d] s8,  D[%d x %d] s32\n\n",
+           M_GLOBAL, K_GLOBAL, K_GLOBAL, N_GLOBAL, M_GLOBAL, N_GLOBAL);
+
+    findHggcDevice(argc, (const char **)argv);
+
+    const size_t a_bytes = M_GLOBAL * K_GLOBAL * sizeof(int8_t);
+    const size_t b_bytes = K_GLOBAL * N_GLOBAL * sizeof(int8_t);
+    const size_t d_bytes = M_GLOBAL * N_GLOBAL * sizeof(int32_t);
+
+    int8_t  *h_A = (int8_t *)malloc(a_bytes);
+    int8_t  *h_B = (int8_t *)malloc(b_bytes);
+    int32_t *h_D_ppu = (int32_t *)malloc(d_bytes);
+    int32_t *h_D_ref = (int32_t *)malloc(d_bytes);
+
+    // Fully random int8 values [-128, 127]
+    unsigned seed = (unsigned)time(NULL);
+    srand(seed);
+    printf("  Random seed: %u\n", seed);
+    for (int i = 0; i < M_GLOBAL * K_GLOBAL; ++i)
+        h_A[i] = (int8_t)(rand() % 256 - 128);
+    for (int i = 0; i < K_GLOBAL * N_GLOBAL; ++i)
+        h_B[i] = (int8_t)(rand() % 256 - 128);
+
+    int8_t *d_A, *d_B;
+    int32_t *d_D;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_A), a_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_B), b_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_D), d_bytes));
+    checkHggcErrors(hggcMemcpy(d_A, h_A, a_bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_B, h_B, b_bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemset(d_D, 0, d_bytes));
+
+    dim3 grid(N_GLOBAL / TILE_N, M_GLOBAL / TILE_M);
+    dim3 block(kBlockSize);
+
+    HggcTimer timer;
+    timer.start();
+    tix_tc_gemm_int8_kernel<<<grid, block>>>(d_A, d_B, d_D, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+    getLastHggcError("tix_tc_gemm_int8_kernel failed");
+    checkHggcErrors(hggcDeviceSynchronize());
+    timer.stop();
+    printf("  PPU kernel time: %.3f ms\n", timer.elapsed());
+
+    checkHggcErrors(hggcMemcpy(h_D_ppu, d_D, d_bytes, hggcMemcpyDeviceToHost));
+
+    gemm_int8_cpu(h_D_ref, h_A, h_B, M_GLOBAL, N_GLOBAL, K_GLOBAL);
+
+    // Integer MMA should be exact
+    int mismatches = 0;
+    for (int i = 0; i < M_GLOBAL * N_GLOBAL && mismatches < 5; ++i) {
+        if (h_D_ppu[i] != h_D_ref[i]) {
+            printf("  MISMATCH at [%d]: ppu=%d ref=%d\n", i, h_D_ppu[i], h_D_ref[i]);
+            mismatches++;
+        }
+    }
+    bool pass = (mismatches == 0);
+    printf("  Mismatches: %d\n", mismatches);
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+
+    free(h_A); free(h_B); free(h_D_ppu); free(h_D_ref);
+    checkHggcErrors(hggcFree(d_A));
+    checkHggcErrors(hggcFree(d_B));
+    checkHggcErrors(hggcFree(d_D));
+
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

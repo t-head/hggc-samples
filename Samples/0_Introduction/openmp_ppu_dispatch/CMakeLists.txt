@@ -1,0 +1,3 @@
+add_executable(openmp_ppu_dispatch openmp_ppu_dispatch.hg)
+target_include_directories(openmp_ppu_dispatch PRIVATE ${COMMON_DIR})
+target_link_libraries(openmp_ppu_dispatch PRIVATE gomp)

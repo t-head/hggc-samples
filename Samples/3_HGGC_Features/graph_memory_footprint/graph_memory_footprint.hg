@@ -1,0 +1,217 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * graph_memory_footprint -- Graph Memory Node Buffer Reuse Demo
+ *
+ * Demonstrates how HGGC Graph memory alloc/free nodes enable automatic
+ * buffer reuse, reducing peak memory footprint for multi-step pipelines.
+ *
+ * Key design: persistent buffers carry data between steps; graph-managed
+ * scratch buffers are allocated, used, and freed within each step.
+ * Since scratch buffers have non-overlapping lifetimes, the runtime
+ * can reuse the same physical memory for all of them.
+ *
+ * Graph structure:
+ *   alloc_scratch1 -> step1(input, scratch1, mid) -> free_scratch1 ->
+ *   alloc_scratch2 -> step2(mid, scratch2, output) -> free_scratch2
+ *
+ * scratch1 is freed before scratch2 is allocated -> runtime reuses.
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int N = 4 * 1024 * 1024;  // 4M elements
+constexpr int BLOCK = 256;
+}  // namespace
+
+// ---- Compute kernels ----
+// Each kernel uses a scratch buffer as workspace (simulates multi-pass algorithms).
+// The scratch is only live during kernel execution, freed immediately after.
+
+// Step 1: input -> scratch -> mid
+//   scratch[i] = input[i] * 2.0
+//   mid[i] = scratch[i] + 1.0
+__global__ void step1_kernel(const float *input, float *scratch, float *mid, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        scratch[i] = input[i] * 2.0f;
+        mid[i] = scratch[i] + 1.0f;
+    }
+}
+
+// Step 2: mid -> scratch -> output
+//   scratch[i] = mid[i] * 3.0
+//   output[i] = scratch[i] - 0.5
+__global__ void step2_kernel(const float *mid, float *scratch, float *output, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        scratch[i] = mid[i] * 3.0f;
+        output[i] = scratch[i] - 0.5f;
+    }
+}
+
+// ---- Graph construction with memory nodes ----
+
+static void build_pipeline_graph(
+    hggcGraphExec_t *exec_out,
+    float *d_input, float *d_mid, float *d_output,
+    int n, int device)
+{
+    hggcGraph_t graph;
+    checkHggcErrors(hggcGraphCreate(&graph, 0));
+
+    dim3 grid((n + BLOCK - 1) / BLOCK);
+    dim3 block(BLOCK);
+
+    // Scratch buffer size (same for both steps to maximize reuse opportunity)
+    size_t scratch_bytes = n * sizeof(float);  // 16 MB
+
+    hggcMemAllocNodeParams allocParams;
+    memset(&allocParams, 0, sizeof(allocParams));
+    allocParams.bytesize = scratch_bytes;
+    allocParams.poolProps.allocType = hggcMemAllocationTypePinned;
+    allocParams.poolProps.location.id = device;
+    allocParams.poolProps.location.type = hggcMemLocationTypeDevice;
+
+    hggcGraphNode_t allocNode1, freeNode1, kernelNode1;
+    hggcGraphNode_t allocNode2, freeNode2, kernelNode2;
+
+    // ---- Step 1: alloc scratch -> kernel(input, scratch, mid) -> free scratch ----
+    checkHggcErrors(hggcGraphAddMemAllocNode(&allocNode1, graph, NULL, 0, &allocParams));
+    float *d_scratch1 = (float *)allocParams.dptr;
+
+    {
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)step1_kernel;
+        kp.gridDim = grid; kp.blockDim = block;
+        int nn = n;
+        void *args[] = {&d_input, &d_scratch1, &d_mid, &nn};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&kernelNode1, graph, &allocNode1, 1, &kp));
+    }
+
+    checkHggcErrors(hggcGraphAddMemFreeNode(&freeNode1, graph, &kernelNode1, 1, (void *)d_scratch1));
+
+    // ---- Step 2: alloc scratch -> kernel(mid, scratch, output) -> free scratch ----
+    // Scratch2 allocated AFTER scratch1 freed -> runtime can reuse physical memory
+    checkHggcErrors(hggcGraphAddMemAllocNode(&allocNode2, graph, &freeNode1, 1, &allocParams));
+    float *d_scratch2 = (float *)allocParams.dptr;
+
+    {
+        hggcKernelNodeParams kp = {};
+        kp.func = (void *)step2_kernel;
+        kp.gridDim = grid; kp.blockDim = block;
+        int nn = n;
+        void *args[] = {&d_mid, &d_scratch2, &d_output, &nn};
+        kp.kernelParams = args;
+        checkHggcErrors(hggcGraphAddKernelNode(&kernelNode2, graph, &allocNode2, 1, &kp));
+    }
+
+    checkHggcErrors(hggcGraphAddMemFreeNode(&freeNode2, graph, &kernelNode2, 1, (void *)d_scratch2));
+
+    // Instantiate
+    checkHggcErrors(hggcGraphInstantiate(exec_out, graph, NULL, NULL, 0));
+    checkHggcErrors(hggcGraphDestroy(graph));
+}
+
+// ---- Main ----
+
+int main(int argc, char **argv)
+{
+    printf("[graph_memory_footprint] Graph Memory Node Buffer Reuse\n\n");
+
+    int device = findHggcDevice(argc, (const char **)argv);
+
+    // Host data
+    float *h_input = (float *)malloc(N * sizeof(float));
+    float *h_output = (float *)malloc(N * sizeof(float));
+    for (int i = 0; i < N; ++i) h_input[i] = (float)(i % 1000) * 0.001f;
+
+    // Persistent device buffers (not managed by graph)
+    float *d_input, *d_mid, *d_output;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_mid), N * sizeof(float)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output), N * sizeof(float)));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, N * sizeof(float), hggcMemcpyHostToDevice));
+
+    // Build and launch graph
+    hggcGraphExec_t graphExec;
+    build_pipeline_graph(&graphExec, d_input, d_mid, d_output, N, device);
+
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+
+    checkHggcErrors(hggcGraphLaunch(graphExec, stream));
+    checkHggcErrors(hggcStreamSynchronize(stream));
+
+    // Query memory footprint attributes
+    uint64_t usedMemCurrent = 0, usedMemHigh = 0;
+    uint64_t reservedMemCurrent = 0, reservedMemHigh = 0;
+    checkHggcErrors(hggcDeviceGetGraphMemAttribute(device, hggcGraphMemAttrUsedMemCurrent, &usedMemCurrent));
+    checkHggcErrors(hggcDeviceGetGraphMemAttribute(device, hggcGraphMemAttrUsedMemHigh, &usedMemHigh));
+    checkHggcErrors(hggcDeviceGetGraphMemAttribute(device, hggcGraphMemAttrReservedMemCurrent, &reservedMemCurrent));
+    checkHggcErrors(hggcDeviceGetGraphMemAttribute(device, hggcGraphMemAttrReservedMemHigh, &reservedMemHigh));
+
+    size_t scratch_bytes = N * sizeof(float);  // 16 MB per scratch
+    printf("  Scratch buffer size: %zu bytes (%.1f MB)\n", scratch_bytes, scratch_bytes / (1024.0 * 1024.0));
+    printf("  Number of scratch allocs: 2\n");
+    printf("  Without reuse (both alive): %zu bytes (%.1f MB)\n",
+           scratch_bytes * 2, scratch_bytes * 2 / (1024.0 * 1024.0));
+    printf("  With reuse (sequential): %zu bytes (%.1f MB)\n\n",
+           scratch_bytes, scratch_bytes / (1024.0 * 1024.0));
+
+    printf("  Graph memory attributes (from runtime):\n");
+    printf("    UsedMemCurrent:     %llu bytes (%.1f MB)\n",
+           (unsigned long long)usedMemCurrent, usedMemCurrent / (1024.0 * 1024.0));
+    printf("    UsedMemHigh:        %llu bytes (%.1f MB)\n",
+           (unsigned long long)usedMemHigh, usedMemHigh / (1024.0 * 1024.0));
+    printf("    ReservedMemCurrent: %llu bytes (%.1f MB)\n",
+           (unsigned long long)reservedMemCurrent, reservedMemCurrent / (1024.0 * 1024.0));
+    printf("    ReservedMemHigh:    %llu bytes (%.1f MB)\n\n",
+           (unsigned long long)reservedMemHigh, reservedMemHigh / (1024.0 * 1024.0));
+
+    // Verify computation: output = (input * 2 + 1) * 3 - 0.5
+    checkHggcErrors(hggcMemcpy(h_output, d_output, N * sizeof(float), hggcMemcpyDeviceToHost));
+
+    bool pass = true;
+    for (int i = 0; i < N; ++i) {
+        float inp = (float)(i % 1000) * 0.001f;
+        float expected = (inp * 2.0f + 1.0f) * 3.0f - 0.5f;
+        if (fabsf(h_output[i] - expected) > 1e-4f) {
+            printf("  MISMATCH at [%d]: got=%f expected=%f\n", i, h_output[i], expected);
+            pass = false;
+            break;
+        }
+    }
+
+    // Trim graph memory
+    checkHggcErrors(hggcDeviceGraphMemTrim(device));
+    printf("  Graph memory trimmed.\n");
+
+    // Cleanup
+    checkHggcErrors(hggcGraphExecDestroy(graphExec));
+    checkHggcErrors(hggcStreamDestroy(stream));
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_mid));
+    checkHggcErrors(hggcFree(d_output));
+    free(h_input); free(h_output);
+
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

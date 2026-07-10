@@ -1,0 +1,2 @@
+add_executable(graph_memory_footprint graph_memory_footprint.hg)
+target_include_directories(graph_memory_footprint PRIVATE ${COMMON_DIR})

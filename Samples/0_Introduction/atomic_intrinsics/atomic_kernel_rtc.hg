@@ -1,0 +1,32 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include "atomic_kernel.hgh"
+
+extern "C" __global__ void atomic_op_suite(int *slots)
+{
+    const unsigned int tid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    /// Bitwise group.
+    atomicAnd(&slots[kSlotAnd], 2 * tid + 7);
+    atomicOr (&slots[kSlotOr],  1 << tid);
+    atomicXor(&slots[kSlotXor], tid);
+
+    /// Arithmetic group.
+    atomicAdd(&slots[kSlotAdd], 10);
+    atomicSub(&slots[kSlotSub], 10);
+    atomicExch(&slots[kSlotExch], tid);
+    atomicMax(&slots[kSlotMax], tid);
+    atomicMin(&slots[kSlotMin], tid);
+
+    /// Counter group.
+    atomicInc((unsigned int *)&slots[kSlotInc], ATOMIC_INC_LIMIT);
+    atomicDec((unsigned int *)&slots[kSlotDec], ATOMIC_DEC_LIMIT);
+    atomicCAS(&slots[kSlotCas], tid - 1, tid);
+}

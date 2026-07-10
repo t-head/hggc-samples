@@ -1,0 +1,315 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ */
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <random>
+#include <vector>
+#include <omp.h>
+
+#include <acblas_v2.h>
+#include <hggc_runtime.h>
+
+#include <helper_functions.h>
+#include <helper_hggc.h>
+
+#ifndef MAX
+#define MAX(a, b) (a > b ? a : b)
+#endif
+
+namespace {
+
+constexpr int   kZcVectorLen      = 1048576;
+constexpr int   kZcBlockThreads   = 256;
+constexpr int   kMsTaskCount      = 40;
+constexpr int   kMsThreadCount    = 4;
+constexpr int   kMsHostSizeLimit  = 100;
+constexpr int   kMsMaxMatrixDim   = 1000;
+constexpr int   kMsMinMatrixDim   = 64;
+constexpr float kZcResidualLimit  = 1.0e-6f;
+
+enum class MemModel { kAuto, kZeroCopy, kManagedStreams };
+
+MemModel parse_mode(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strncmp(argv[i], "--mode=", 7) == 0) {
+            const char *kind = argv[i] + 7;
+            if (std::strcmp(kind, "zero_copy") == 0)       return MemModel::kZeroCopy;
+            if (std::strcmp(kind, "managed_streams") == 0) return MemModel::kManagedStreams;
+        }
+    }
+    return MemModel::kAuto;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path A : zero-copy (pinned + mapped) vector add
+ * ============================================================ */
+
+/// Element-wise vector add over a host-mapped buffer.
+__global__ void vec_add_mapped(const float *src_a, const float *src_b, float *dst, int element_count) {
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < element_count) {
+        dst[slot] = src_a[slot] + src_b[slot];
+    }
+}
+
+namespace {
+
+int run_zero_copy(int argc, char **argv) {
+    int dev_id = 0;
+    char *user_dev = nullptr;
+    if (getArgStr(argc, const_cast<const char **>(argv), "device", &user_dev) && user_dev != nullptr) {
+        int visible = 0;
+        hggcGetDeviceCount(&visible);
+        const int requested = std::atoi(user_dev);
+        dev_id = (requested >= 0 && requested < visible) ? requested : 0;
+    }
+
+    checkHggcErrors(hggcSetDevice(dev_id));
+
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+    if (!dev_prop.canMapHostMemory) {
+        std::fprintf(stderr, " device %d cannot map host memory, waiving.\n", dev_id);
+        return EXIT_SKIPPED;
+    }
+    checkHggcErrors(hggcSetDeviceFlags(hggcDeviceMapHost));
+
+    const int    element_count = kZcVectorLen;
+    const size_t buf_bytes     = element_count * sizeof(float);
+
+    /// Page-locked, mapped host allocations -> directly addressable from the device.
+    float *host_a = nullptr;
+    float *host_b = nullptr;
+    float *host_c = nullptr;
+    checkHggcErrors(hggcHostAlloc(reinterpret_cast<void **>(&host_a), buf_bytes, hggcHostAllocMapped));
+    checkHggcErrors(hggcHostAlloc(reinterpret_cast<void **>(&host_b), buf_bytes, hggcHostAllocMapped));
+    checkHggcErrors(hggcHostAlloc(reinterpret_cast<void **>(&host_c), buf_bytes, hggcHostAllocMapped));
+
+    std::mt19937                          rng(0x5a5a5a5au);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    for (int i = 0; i < element_count; ++i) {
+        host_a[i] = dist(rng);
+        host_b[i] = dist(rng);
+    }
+
+    /// Resolve device-visible aliases for the mapped host buffers.
+    float *dev_a = nullptr;
+    float *dev_b = nullptr;
+    float *dev_c = nullptr;
+    checkHggcErrors(hggcHostGetDevicePointer(reinterpret_cast<void **>(&dev_a), host_a, 0));
+    checkHggcErrors(hggcHostGetDevicePointer(reinterpret_cast<void **>(&dev_b), host_b, 0));
+    checkHggcErrors(hggcHostGetDevicePointer(reinterpret_cast<void **>(&dev_c), host_c, 0));
+
+    const dim3 block_dim(kZcBlockThreads);
+    const dim3 grid_dim(static_cast<unsigned int>(std::ceil(element_count / static_cast<float>(block_dim.x))));
+
+    printf(" -> mode=zero_copy | launching vec_add_mapped over %d elements\n", element_count);
+    vec_add_mapped<<<grid_dim, block_dim>>>(dev_a, dev_b, dev_c, element_count);
+    checkHggcErrors(hggcDeviceSynchronize());
+    getLastHggcError("vec_add_mapped() execution failed");
+
+    /// Compare against a host-side reference vector add.
+    double err_norm = 0.0;
+    double ref_norm = 0.0;
+    for (int i = 0; i < element_count; ++i) {
+        const double ref  = static_cast<double>(host_a[i]) + static_cast<double>(host_b[i]);
+        const double diff = static_cast<double>(host_c[i]) - ref;
+        err_norm += diff * diff;
+        ref_norm += ref * ref;
+    }
+    const double residual = std::sqrt(err_norm) / std::sqrt(ref_norm);
+    printf("    residual = %.3e\n", residual);
+
+    checkHggcErrors(hggcFreeHost(host_a));
+    checkHggcErrors(hggcFreeHost(host_b));
+    checkHggcErrors(hggcFreeHost(host_c));
+
+    return (residual < kZcResidualLimit) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Path B : managed memory + multi-stream DGEMV tasks
+ * ============================================================ */
+
+namespace {
+
+/// Per-task descriptor backed by `hggcMallocManaged` storage.
+template <typename T> struct ManagedTask {
+    unsigned int dim    = 0;
+    unsigned int tag_id = 0;
+    T           *matrix = nullptr;
+    T           *rhs    = nullptr;
+    T           *out    = nullptr;
+
+    ManagedTask() = default;
+
+    ~ManagedTask() {
+        if (matrix != nullptr) checkHggcErrors(hggcDeviceSynchronize());
+        if (matrix != nullptr) checkHggcErrors(hggcFree(matrix));
+        if (rhs    != nullptr) checkHggcErrors(hggcFree(rhs));
+        if (out    != nullptr) checkHggcErrors(hggcFree(out));
+    }
+
+    void provision(unsigned int side, unsigned int unique_id, std::mt19937_64 &rng) {
+        tag_id = unique_id;
+        dim    = side;
+        checkHggcErrors(hggcMallocManaged(&matrix, sizeof(T) * dim * dim));
+        checkHggcErrors(hggcMallocManaged(&rhs,    sizeof(T) * dim));
+        checkHggcErrors(hggcMallocManaged(&out,    sizeof(T) * dim));
+        checkHggcErrors(hggcDeviceSynchronize());
+
+        std::uniform_real_distribution<T> dist(static_cast<T>(0), static_cast<T>(1));
+        for (unsigned int i = 0; i < dim * dim; ++i) matrix[i] = dist(rng);
+        for (unsigned int i = 0; i < dim; ++i) {
+            rhs[i] = dist(rng);
+            out[i] = static_cast<T>(0);
+        }
+    }
+};
+
+/// Row-major host-side dgemv as the host fast-path for small tasks.
+template <typename T> void host_gemv(int rows, int cols, T alpha, const T *A, const T *x, T beta, T *y) {
+    for (int r = 0; r < rows; ++r) {
+        T acc = beta * y[r];
+        for (int c = 0; c < cols; ++c) {
+            acc += alpha * A[r * cols + c] * x[c];
+        }
+        y[r] = acc;
+    }
+}
+
+/// Decide whether to route a single task to host CPU or device PPU.
+template <typename T>
+void run_task(ManagedTask<T> &task, acblasHandle_t *handles, hggcStream_t *streams, int worker) {
+    if (task.dim < kMsHostSizeLimit) {
+        printf("    task[%u] thread[%d] -> host (dim=%u)\n", task.tag_id, worker, task.dim);
+        checkHggcErrors(hggcStreamAttachMemAsync(streams[0], task.matrix, 0, hggcMemAttachHost));
+        checkHggcErrors(hggcStreamAttachMemAsync(streams[0], task.rhs,    0, hggcMemAttachHost));
+        checkHggcErrors(hggcStreamAttachMemAsync(streams[0], task.out,    0, hggcMemAttachHost));
+        checkHggcErrors(hggcStreamSynchronize(streams[0]));
+        host_gemv<T>(task.dim, task.dim, static_cast<T>(1), task.matrix, task.rhs, static_cast<T>(0), task.out);
+        return;
+    }
+
+    printf("    task[%u] thread[%d] -> device (dim=%u)\n", task.tag_id, worker, task.dim);
+    const T alpha = static_cast<T>(1);
+    const T beta  = static_cast<T>(0);
+    const int slot = worker + 1;
+    checkHggcErrors(acblasSetStream(handles[slot], streams[slot]));
+    checkHggcErrors(hggcStreamAttachMemAsync(streams[slot], task.matrix, 0, hggcMemAttachSingle));
+    checkHggcErrors(hggcStreamAttachMemAsync(streams[slot], task.rhs,    0, hggcMemAttachSingle));
+    checkHggcErrors(hggcStreamAttachMemAsync(streams[slot], task.out,    0, hggcMemAttachSingle));
+    checkHggcErrors(acblasDgemv(handles[slot], ACBLAS_OP_N,
+                                task.dim, task.dim, &alpha,
+                                task.matrix, task.dim, task.rhs, 1,
+                                &beta, task.out, 1));
+}
+
+int run_managed_streams(int argc, char **argv) {
+    const int dev_id = findHggcDevice(argc, const_cast<const char **>(argv));
+    hggcDeviceProp dev_prop{};
+    checkHggcErrors(hggcGetDeviceProperties(&dev_prop, dev_id));
+
+    if (!dev_prop.managedMemory) {
+        std::fprintf(stderr, " managed memory not supported, waiving.\n");
+        return EXIT_SKIPPED;
+    }
+
+    printf(" -> mode=managed_streams | %d threads, %d tasks\n", kMsThreadCount, kMsTaskCount);
+
+    /// One stream + handle for the host fast-path slot, plus one per worker thread.
+    std::vector<hggcStream_t>   streams(kMsThreadCount + 1, nullptr);
+    std::vector<acblasHandle_t> handles(kMsThreadCount + 1);
+    for (int i = 0; i < kMsThreadCount + 1; ++i) {
+        checkHggcErrors(hggcStreamCreate(&streams[i]));
+        checkHggcErrors(acblasCreate(&handles[i]));
+    }
+
+    /// Build a randomised task list backed by managed allocations.
+    std::mt19937_64                              rng(static_cast<uint64_t>(std::time(nullptr)));
+    std::uniform_int_distribution<unsigned int>  dim_dist(kMsMinMatrixDim, kMsMaxMatrixDim);
+    std::vector<ManagedTask<double>>             tasks(kMsTaskCount);
+    for (int i = 0; i < kMsTaskCount; ++i) {
+        tasks[i].provision(dim_dist(rng), static_cast<unsigned int>(i), rng);
+    }
+
+    /// Fan tasks out across OpenMP workers; each worker owns a stream slot.
+    omp_set_num_threads(kMsThreadCount);
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < kMsTaskCount; ++i) {
+        checkHggcErrors(hggcSetDevice(dev_id));
+        const int worker = omp_get_thread_num();
+        run_task<double>(tasks[i], handles.data(), streams.data(), worker);
+    }
+
+    hggcDeviceSynchronize();
+
+    for (int i = 0; i < kMsThreadCount + 1; ++i) {
+        hggcStreamDestroy(streams[i]);
+        acblasDestroy(handles[i]);
+    }
+
+    printf("    all managed-memory tasks finished\n");
+    return EXIT_SUCCESS;
+}
+
+MemModel resolve_model(MemModel requested) {
+    if (requested != MemModel::kAuto) return requested;
+
+    int dev_id = 0;
+    if (hggcGetDeviceCount(&dev_id) != hggcSuccess || dev_id <= 0) return MemModel::kZeroCopy;
+
+    hggcDeviceProp probe{};
+    if (hggcGetDeviceProperties(&probe, 0) != hggcSuccess) return MemModel::kZeroCopy;
+    return probe.managedMemory ? MemModel::kManagedStreams : MemModel::kZeroCopy;
+}
+
+}  /// anonymous
+
+/* ============================================================
+ *   Entry point
+ * ============================================================ */
+
+int main(int argc, char **argv) {
+    if (hasArg(argc, const_cast<const char **>(argv), "help")) {
+        printf("Usage: unified_memory_models [OPTIONS]\n");
+        printf("  --mode=zero_copy|managed_streams  Pick the memory model demo.\n");
+        printf("  --device=<idx>                    Select a HGGC device (zero_copy only).\n");
+        return EXIT_SUCCESS;
+    }
+
+    const MemModel requested = parse_mode(argc, argv);
+    const MemModel active    = resolve_model(requested);
+
+    int rc = EXIT_FAILURE;
+    switch (active) {
+        case MemModel::kZeroCopy:
+            rc = run_zero_copy(argc, argv);
+            break;
+        case MemModel::kManagedStreams:
+        default:
+            rc = run_managed_streams(argc, argv);
+            break;
+    }
+
+    if (rc == EXIT_SUCCESS)        printf("[unified_memory_models] passed\n");
+    else if (rc == EXIT_SKIPPED)    printf("[unified_memory_models] waived\n");
+    else                           printf("[unified_memory_models] failed\n");
+
+    return rc;
+}

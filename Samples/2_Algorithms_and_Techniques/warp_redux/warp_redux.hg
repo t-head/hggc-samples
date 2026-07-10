@@ -1,0 +1,260 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * warp_redux -- Hardware Warp-Level Reduction (ppu.redux.sync)
+ *
+ * Demonstrates the TIX `ppu.redux.sync` instruction which performs a
+ * single-cycle warp-wide reduction without requiring multiple shuffle
+ * iterations.  Each test compares the hardware redux result against a
+ * traditional __shfl_down_sync loop to verify correctness.
+ *
+ * Operations showcased:
+ *   1. ppu.redux.sync.add.s32  -- warp sum
+ *   2. ppu.redux.sync.min.s32  -- warp minimum
+ *   3. ppu.redux.sync.max.s32  -- warp maximum
+ *   4. ppu.redux.sync.xor.b32  -- warp XOR (parity)
+ */
+#include <cstdio>
+#include <cstdlib>
+#include <climits>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int WARP_SIZE = 32;
+constexpr int NUM_WARPS = 128;  // number of independent warps to test
+constexpr int N = NUM_WARPS * WARP_SIZE;
+constexpr int BLOCK = 256;
+constexpr int GRID = (N + BLOCK - 1) / BLOCK;
+constexpr unsigned int FULL_MASK = 0xFFFFFFFF;
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: warp sum via ppu.redux.sync.add.s32 vs __shfl_down_sync
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void warp_sum_kernel(
+    int * __restrict__ out_redux,
+    int * __restrict__ out_shfl,
+    const int * __restrict__ input,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    int val = input[idx];
+    int warp_idx = idx / WARP_SIZE;
+
+    // Method 1: hardware redux
+    int sum_redux;
+    asm("ppu.redux.sync.add.s32 %0, %1, %2;"
+        : "=r"(sum_redux)
+        : "r"(val), "r"(FULL_MASK));
+
+    // Method 2: traditional shfl_down loop
+    int sum_shfl = val;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum_shfl += __shfl_down_sync(FULL_MASK, sum_shfl, offset);
+    }
+
+    // Lane 0 writes results
+    if (idx % WARP_SIZE == 0) {
+        out_redux[warp_idx] = sum_redux;
+        out_shfl[warp_idx]  = sum_shfl;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: warp min via ppu.redux.sync.min.s32
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void warp_min_kernel(
+    int * __restrict__ out_redux,
+    int * __restrict__ out_shfl,
+    const int * __restrict__ input,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    int val = input[idx];
+    int warp_idx = idx / WARP_SIZE;
+
+    // Hardware redux min
+    int min_redux;
+    asm("ppu.redux.sync.min.s32 %0, %1, %2;"
+        : "=r"(min_redux)
+        : "r"(val), "r"(FULL_MASK));
+
+    // Shfl-based min
+    int min_shfl = val;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        int other = __shfl_down_sync(FULL_MASK, min_shfl, offset);
+        min_shfl = (other < min_shfl) ? other : min_shfl;
+    }
+
+    if (idx % WARP_SIZE == 0) {
+        out_redux[warp_idx] = min_redux;
+        out_shfl[warp_idx]  = min_shfl;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: warp max via ppu.redux.sync.max.s32
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void warp_max_kernel(
+    int * __restrict__ out_redux,
+    int * __restrict__ out_shfl,
+    const int * __restrict__ input,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    int val = input[idx];
+    int warp_idx = idx / WARP_SIZE;
+
+    // Hardware redux max
+    int max_redux;
+    asm("ppu.redux.sync.max.s32 %0, %1, %2;"
+        : "=r"(max_redux)
+        : "r"(val), "r"(FULL_MASK));
+
+    // Shfl-based max
+    int max_shfl = val;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        int other = __shfl_down_sync(FULL_MASK, max_shfl, offset);
+        max_shfl = (other > max_shfl) ? other : max_shfl;
+    }
+
+    if (idx % WARP_SIZE == 0) {
+        out_redux[warp_idx] = max_redux;
+        out_shfl[warp_idx]  = max_shfl;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Kernel: warp XOR via ppu.redux.sync.xor.b32
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void warp_xor_kernel(
+    unsigned int * __restrict__ out_redux,
+    unsigned int * __restrict__ out_shfl,
+    const unsigned int * __restrict__ input,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned int val = input[idx];
+    int warp_idx = idx / WARP_SIZE;
+
+    // Hardware redux xor
+    unsigned int xor_redux;
+    asm("ppu.redux.sync.xor.b32 %0, %1, %2;"
+        : "=r"(xor_redux)
+        : "r"(val), "r"(FULL_MASK));
+
+    // Shfl-based xor
+    unsigned int xor_shfl = val;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        xor_shfl ^= __shfl_down_sync(FULL_MASK, xor_shfl, offset);
+    }
+
+    if (idx % WARP_SIZE == 0) {
+        out_redux[warp_idx] = xor_redux;
+        out_shfl[warp_idx]  = xor_shfl;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Host
+// ═══════════════════════════════════════════════════════════════════════
+
+static bool compare_results(const int *redux, const int *shfl, int count, const char *op_name)
+{
+    bool pass = true;
+    for (int i = 0; i < count; ++i) {
+        if (redux[i] != shfl[i]) {
+            printf("    MISMATCH at warp %d: redux=%d  shfl=%d\n", i, redux[i], shfl[i]);
+            pass = false;
+            break;
+        }
+    }
+    printf("  %-28s %s\n", op_name, pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+int main(int argc, char **argv)
+{
+    printf("[warp_redux] Hardware Warp-Level Reduction (ppu.redux.sync)\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    // Host input: deterministic data with variety.
+    int *h_input = (int *)malloc(N * sizeof(int));
+    for (int i = 0; i < N; ++i) {
+        h_input[i] = (i * 7 - 2048) % 1000;  // range ~ [-2048, 2048]
+    }
+
+    // Device buffers.
+    int *d_input;
+    int *d_out_redux, *d_out_shfl;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input), N * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out_redux), NUM_WARPS * sizeof(int)));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_out_shfl), NUM_WARPS * sizeof(int)));
+    checkHggcErrors(hggcMemcpy(d_input, h_input, N * sizeof(int), hggcMemcpyHostToDevice));
+
+    int *h_redux = (int *)malloc(NUM_WARPS * sizeof(int));
+    int *h_shfl  = (int *)malloc(NUM_WARPS * sizeof(int));
+    bool all_pass = true;
+
+    // ---- Test 1: warp sum ----
+    warp_sum_kernel<<<GRID, BLOCK>>>(d_out_redux, d_out_shfl, d_input, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    checkHggcErrors(hggcMemcpy(h_redux, d_out_redux, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_shfl, d_out_shfl, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    all_pass &= compare_results(h_redux, h_shfl, NUM_WARPS, "ppu.redux.sync.add.s32");
+
+    // ---- Test 2: warp min ----
+    warp_min_kernel<<<GRID, BLOCK>>>(d_out_redux, d_out_shfl, d_input, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    checkHggcErrors(hggcMemcpy(h_redux, d_out_redux, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_shfl, d_out_shfl, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    all_pass &= compare_results(h_redux, h_shfl, NUM_WARPS, "ppu.redux.sync.min.s32");
+
+    // ---- Test 3: warp max ----
+    warp_max_kernel<<<GRID, BLOCK>>>(d_out_redux, d_out_shfl, d_input, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    checkHggcErrors(hggcMemcpy(h_redux, d_out_redux, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_shfl, d_out_shfl, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    all_pass &= compare_results(h_redux, h_shfl, NUM_WARPS, "ppu.redux.sync.max.s32");
+
+    // ---- Test 4: warp XOR ----
+    unsigned int *d_input_u = reinterpret_cast<unsigned int *>(d_input);
+    unsigned int *d_redux_u = reinterpret_cast<unsigned int *>(d_out_redux);
+    unsigned int *d_shfl_u  = reinterpret_cast<unsigned int *>(d_out_shfl);
+    warp_xor_kernel<<<GRID, BLOCK>>>(d_redux_u, d_shfl_u, d_input_u, N);
+    checkHggcErrors(hggcDeviceSynchronize());
+    checkHggcErrors(hggcMemcpy(h_redux, d_out_redux, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    checkHggcErrors(hggcMemcpy(h_shfl, d_out_shfl, NUM_WARPS * sizeof(int), hggcMemcpyDeviceToHost));
+    all_pass &= compare_results(h_redux, h_shfl, NUM_WARPS, "ppu.redux.sync.xor.b32");
+
+    // Cleanup.
+    free(h_input); free(h_redux); free(h_shfl);
+    checkHggcErrors(hggcFree(d_input));
+    checkHggcErrors(hggcFree(d_out_redux));
+    checkHggcErrors(hggcFree(d_out_shfl));
+
+    printf("\n  Result: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

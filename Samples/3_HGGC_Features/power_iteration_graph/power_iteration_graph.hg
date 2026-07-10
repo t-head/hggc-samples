@@ -1,0 +1,212 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
+ * under the Apache License 2.0 for reference and educational purposes.
+ *
+ * power_iteration_graph -- Graph Exec Parameter Update via Power Iteration
+ *
+ * Demonstrates hggcGraphExecKernelNodeSetParams to dynamically update
+ * kernel parameters of an instantiated graph without rebuilding it.
+ *
+ * Algorithm: Power Iteration to find the dominant eigenvalue/eigenvector
+ * of a symmetric matrix.  Each iteration:
+ *   v_new = A * v_old
+ *   v_new = v_new / ||v_new||   (normalize)
+ *   swap(v_old, v_new)          <-- requires GraphExecUpdate
+ *
+ * The swap is done by updating the kernel node parameters in the
+ * existing graph exec, avoiding expensive re-instantiation.
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <helper_functions.h>
+
+namespace {
+constexpr int N = 256;       // matrix dimension
+constexpr int BLOCK = 256;
+constexpr int GRID = (N + BLOCK - 1) / BLOCK;
+constexpr int MAX_ITERS = 200;
+constexpr float TOL = 1e-6f;
+}  // namespace
+
+// ---- Kernels ----
+
+// Matrix-vector multiply: y = A * x (A is NxN, row-major)
+__global__ void matvec_kernel(const float *A, const float *x, float *y, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+
+    float sum = 0.0f;
+    for (int j = 0; j < n; ++j)
+        sum += A[row * n + j] * x[j];
+    y[row] = sum;
+}
+
+// Compute L2 norm squared (partial reduction, single block for simplicity)
+__global__ void norm_sq_kernel(const float *v, float *norm_sq, int n)
+{
+    __shared__ float smem[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x)
+        sum += v[i] * v[i];
+    smem[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) *norm_sq = smem[0];
+}
+
+// Normalize: v[i] = v[i] / sqrt(norm_sq)
+__global__ void normalize_kernel(float *v, const float *norm_sq, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    v[i] = v[i] / sqrtf(*norm_sq);
+}
+
+// ---- Host ----
+
+int main(int argc, char **argv)
+{
+    printf("[power_iteration_graph] Graph Exec Parameter Update\n\n");
+
+    findHggcDevice(argc, (const char **)argv);
+
+    size_t mat_bytes = N * N * sizeof(float);
+    size_t vec_bytes = N * sizeof(float);
+
+    // Create diagonal matrix with planted dominant eigenvalue
+    // A[i][i] = rand(1, N/4) for i in [0, N-2], A[N-1][N-1] = N
+    // Spectral gap ~ (N/4)/N = 0.25, ensures fast convergence
+    srand((unsigned)time(NULL));
+    float *h_A = (float *)calloc(N * N, sizeof(float));
+    for (int i = 0; i < N - 1; ++i)
+        h_A[i * N + i] = (float)(rand() % (N / 4) + 1);
+    h_A[(N - 1) * N + (N - 1)] = (float)N;  // dominant eigenvalue = N
+
+    float *h_v = (float *)malloc(vec_bytes);
+    for (int i = 0; i < N; ++i) h_v[i] = 1.0f;  // initial guess
+
+    // Device allocations
+    float *d_A, *d_v0, *d_v1, *d_norm_sq;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_A), mat_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_v0), vec_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_v1), vec_bytes));
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_norm_sq), sizeof(float)));
+    checkHggcErrors(hggcMemcpy(d_A, h_A, mat_bytes, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy(d_v0, h_v, vec_bytes, hggcMemcpyHostToDevice));
+
+    // ---- Build graph: matvec(A, v_src, v_dst) -> norm -> normalize(v_dst) ----
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+
+    // Use stream capture to build the graph
+    checkHggcErrors(hggcStreamBeginCapture(stream, hggcStreamCaptureModeGlobal));
+
+    int n = N;
+    matvec_kernel<<<GRID, BLOCK, 0, stream>>>(d_A, d_v0, d_v1, n);
+    norm_sq_kernel<<<1, BLOCK, 0, stream>>>(d_v1, d_norm_sq, n);
+    normalize_kernel<<<GRID, BLOCK, 0, stream>>>(d_v1, d_norm_sq, n);
+
+    hggcGraph_t graph;
+    checkHggcErrors(hggcStreamEndCapture(stream, &graph));
+
+    hggcGraphExec_t graphExec;
+    checkHggcErrors(hggcGraphInstantiate(&graphExec, graph, NULL, NULL, 0));
+
+    // Get kernel nodes for parameter update
+    size_t numNodes = 0;
+    checkHggcErrors(hggcGraphGetNodes(graph, NULL, &numNodes));
+    hggcGraphNode_t *nodes = (hggcGraphNode_t *)malloc(numNodes * sizeof(hggcGraphNode_t));
+    checkHggcErrors(hggcGraphGetNodes(graph, nodes, &numNodes));
+
+    // ---- Iterative power method with GraphExecUpdate ----
+    printf("  Matrix: %dx%d diagonal, expected eigenvalue = %d\n\n", N, N, N);
+
+    float *src = d_v0;
+    float *dst = d_v1;
+    float eigenvalue = 0.0f;
+
+    for (int iter = 0; iter < MAX_ITERS; ++iter) {
+        // Launch current graph (matvec: A*src -> dst, then normalize dst)
+        checkHggcErrors(hggcGraphLaunch(graphExec, stream));
+        checkHggcErrors(hggcStreamSynchronize(stream));
+
+        // Compute eigenvalue estimate: lambda = dot(A*v, v) / dot(v, v) = ||A*v|| before normalize
+        float norm_sq_val;
+        checkHggcErrors(hggcMemcpy(&norm_sq_val, d_norm_sq, sizeof(float), hggcMemcpyDeviceToHost));
+        float new_eigenvalue = sqrtf(norm_sq_val);
+
+        if (fabsf(new_eigenvalue - eigenvalue) < TOL) {
+            eigenvalue = new_eigenvalue;
+            printf("  Converged at iteration %d\n", iter + 1);
+            break;
+        }
+        eigenvalue = new_eigenvalue;
+
+        // Swap src and dst for next iteration by updating graph exec
+        float *tmp = src; src = dst; dst = tmp;
+
+        // Update matvec kernel node parameters (node 0): swap src/dst
+        {
+            hggcKernelNodeParams kp = {};
+            kp.func = (void *)matvec_kernel;
+            kp.gridDim = dim3(GRID);
+            kp.blockDim = dim3(BLOCK);
+            void *args[] = {&d_A, &src, &dst, &n};
+            kp.kernelParams = args;
+            checkHggcErrors(hggcGraphExecKernelNodeSetParams(graphExec, nodes[0], &kp));
+        }
+        // Update norm kernel (node 1): point to new dst
+        {
+            hggcKernelNodeParams kp = {};
+            kp.func = (void *)norm_sq_kernel;
+            kp.gridDim = dim3(1);
+            kp.blockDim = dim3(BLOCK);
+            void *args[] = {&dst, &d_norm_sq, &n};
+            kp.kernelParams = args;
+            checkHggcErrors(hggcGraphExecKernelNodeSetParams(graphExec, nodes[1], &kp));
+        }
+        // Update normalize kernel (node 2): point to new dst
+        {
+            hggcKernelNodeParams kp = {};
+            kp.func = (void *)normalize_kernel;
+            kp.gridDim = dim3(GRID);
+            kp.blockDim = dim3(BLOCK);
+            void *args[] = {&dst, &d_norm_sq, &n};
+            kp.kernelParams = args;
+            checkHggcErrors(hggcGraphExecKernelNodeSetParams(graphExec, nodes[2], &kp));
+        }
+    }
+
+    printf("  Dominant eigenvalue: %.6f (expected: %d)\n", eigenvalue, N);
+
+    bool pass = (fabsf(eigenvalue - (float)N) < 0.1f);
+    printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
+
+    // Cleanup
+    free(nodes);
+    free(h_A); free(h_v);
+    checkHggcErrors(hggcGraphExecDestroy(graphExec));
+    checkHggcErrors(hggcGraphDestroy(graph));
+    checkHggcErrors(hggcStreamDestroy(stream));
+    checkHggcErrors(hggcFree(d_A));
+    checkHggcErrors(hggcFree(d_v0));
+    checkHggcErrors(hggcFree(d_v1));
+    checkHggcErrors(hggcFree(d_norm_sq));
+
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}
