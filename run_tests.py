@@ -176,6 +176,46 @@ def get_ppu_count():
     # Unable to determine, assume no PPUs
     return 0
 
+def get_ppu_arch(args_arch=None):
+    """Return the current PPU architecture name (e.g. ppu001, ppu0015).
+
+    Resolution order:
+      1. Explicit --arch command-line argument
+      2. HGGC_TARGET_ARCH environment variable
+      3. Heuristic parsing of ppu-smi product name
+
+    Returns None if the architecture cannot be determined.
+    """
+    if args_arch:
+        return args_arch
+
+    env_arch = os.environ.get("HGGC_TARGET_ARCH", "").strip()
+    if env_arch:
+        return env_arch
+
+    try:
+        smi = subprocess.run(
+            ["ppu-smi", "-L"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if smi.returncode == 0:
+            text = smi.stdout.lower()
+            # Common product-name hints for ppu0015
+            if any(h in text for h in ("ppu-0015", "ppu0015", "m890")):
+                return "ppu0015"
+            # Common product-name hints for ppu001
+            if any(h in text for h in ("ppu-001", "ppu001", "m810")):
+                return "ppu001"
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    return None
+
 def main():
     parser = argparse.ArgumentParser(description='Run all executables and capture output')
     parser.add_argument('--dir', default='.', help='Root directory to search for executables')
@@ -183,6 +223,7 @@ def main():
     parser.add_argument('--output', default='.',  # Default to current directory
                        help='Output directory for test results')
     parser.add_argument('--parallel', type=int, default=1, help='Number of parallel tests to run')
+    parser.add_argument('--arch', help='Target PPU architecture (e.g. ppu001, ppu0015) for skip_arch checks')
     parser.add_argument('--args', nargs=argparse.REMAINDER,
                        help='Global arguments to pass to all executables')
     args = parser.parse_args()
@@ -202,6 +243,13 @@ def main():
     else:
         print(f"Detected {ppu_count} PPU(s).")
 
+    # Determine the target architecture for skip_arch checks
+    ppu_arch = get_ppu_arch(args.arch)
+    if ppu_arch:
+        print(f"Detected target architecture: {ppu_arch}.")
+    elif args.arch:
+        print(f"Warning: requested architecture '{args.arch}' could not be confirmed.")
+
     executables = find_executables(args.dir)
     if not executables:
         print("No executables found!")
@@ -220,6 +268,13 @@ def main():
         if base_name in args_config and args_config[base_name].get("skip", False):
             safe_print(f"Skipping {exe_name} (marked as skip in config)")
             continue
+
+        # Skip if the sample is marked incompatible with the current architecture
+        if ppu_arch:
+            skip_archs = args_config.get(base_name, {}).get("skip_arch", [])
+            if ppu_arch in skip_archs:
+                safe_print(f"Skipping {exe_name} (incompatible with {ppu_arch})")
+                continue
 
         # Skip if the sample requires more PPUs than available
         required_ppus = args_config.get(base_name, {}).get("min_ppus", 1)
