@@ -219,7 +219,9 @@ def get_ppu_arch(args_arch=None):
 def main():
     parser = argparse.ArgumentParser(description='Run all executables and capture output')
     parser.add_argument('--dir', default='.', help='Root directory to search for executables')
-    parser.add_argument('--config', help='JSON configuration file for executable arguments')
+    parser.add_argument('--config',
+                       help='JSON configuration file for executable arguments '
+                            '(defaults to test_args.json if present)')
     parser.add_argument('--output', default='.',  # Default to current directory
                        help='Output directory for test results')
     parser.add_argument('--parallel', type=int, default=1, help='Number of parallel tests to run')
@@ -233,7 +235,13 @@ def main():
         os.makedirs(args.output, exist_ok=True)
 
     # Load arguments configuration
-    args_config = load_args_config(args.config)
+    # Default to test_args.json in the current working directory if no --config is given.
+    config_file = args.config
+    if not config_file:
+        default_config = "test_args.json"
+        if os.path.exists(default_config):
+            config_file = default_config
+    args_config = load_args_config(config_file)
 
     # Determine how many PPUs are available
     ppu_count = get_ppu_count()
