@@ -47,6 +47,12 @@ Linux
 
 x86_64
 
+## Supported PPU Architectures
+
+ppu001 only
+
+This sample uses AIU (`ppu.cp.async.aiu.*`) and Tensor Cell (`ppu.tc01.*`) instructions that are not supported on ppu0015.
+
 ## HGGC APIs and Instructions Involved
 
 ### HGGC Runtime API

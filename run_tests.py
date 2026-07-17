@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import subprocess
@@ -177,25 +178,20 @@ def get_ppu_count():
     return 0
 
 def get_ppu_arch(args_arch=None):
-    """Return the current PPU architecture name (e.g. ppu001, ppu0015).
+    """Return the target PPU architecture name (e.g. ppu001, ppu0015).
 
     Resolution order:
       1. Explicit --arch command-line argument
-      2. HGGC_TARGET_ARCH environment variable
-      3. Heuristic parsing of ppu-smi product name
+      2. Compute Capability reported by ppu-smi -q
 
     Returns None if the architecture cannot be determined.
     """
     if args_arch:
         return args_arch
 
-    env_arch = os.environ.get("HGGC_TARGET_ARCH", "").strip()
-    if env_arch:
-        return env_arch
-
     try:
         smi = subprocess.run(
-            ["ppu-smi", "-L"],
+            ["ppu-smi", "-q"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -203,12 +199,15 @@ def get_ppu_arch(args_arch=None):
         )
         if smi.returncode == 0:
             text = smi.stdout.lower()
-            # Common product-name hints for ppu0015
-            if any(h in text for h in ("ppu-0015", "ppu0015", "m890")):
-                return "ppu0015"
-            # Common product-name hints for ppu001
-            if any(h in text for h in ("ppu-001", "ppu001", "m810")):
-                return "ppu001"
+            match = re.search(r"compute capability\s*:\s*(\d+)\.(\d+)", text)
+            if match:
+                major = int(match.group(1))
+                minor = int(match.group(2))
+                cc = major * 10 + minor
+                if cc == 80:
+                    return "ppu001"
+                if cc == 89:
+                    return "ppu0015"
     except FileNotFoundError:
         pass
     except Exception:
@@ -219,10 +218,13 @@ def get_ppu_arch(args_arch=None):
 def main():
     parser = argparse.ArgumentParser(description='Run all executables and capture output')
     parser.add_argument('--dir', default='.', help='Root directory to search for executables')
-    parser.add_argument('--config', help='JSON configuration file for executable arguments')
+    parser.add_argument('--config', help='JSON configuration file for executable arguments '
+                                         '(defaults to test_args.json if present)')
     parser.add_argument('--output', default='.',  # Default to current directory
                        help='Output directory for test results')
     parser.add_argument('--parallel', type=int, default=1, help='Number of parallel tests to run')
+    parser.add_argument('--no-config', action='store_true',
+                       help='Do not auto-load test_args.json')
     parser.add_argument('--arch', help='Target PPU architecture (e.g. ppu001, ppu0015) for skip_arch checks')
     parser.add_argument('--args', nargs=argparse.REMAINDER,
                        help='Global arguments to pass to all executables')
@@ -233,7 +235,14 @@ def main():
         os.makedirs(args.output, exist_ok=True)
 
     # Load arguments configuration
-    args_config = load_args_config(args.config)
+    # Default to test_args.json in the current working directory unless --config
+    # or --no-config is given.
+    config_file = args.config
+    if not config_file and not args.no_config:
+        default_config = "test_args.json"
+        if os.path.exists(default_config):
+            config_file = default_config
+    args_config = load_args_config(config_file)
 
     # Determine how many PPUs are available
     ppu_count = get_ppu_count()
