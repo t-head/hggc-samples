@@ -1,4 +1,4 @@
-cd  $AONE_CI_WORKSPACE/hggc-samples
+cd  $AONE_CI_WORKSPACE
 mkdir -p build && cd build
 cmake ..
 make
