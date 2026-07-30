@@ -2,7 +2,6 @@ triggers:
   merge_request:
     target-branches: 
       - ppu_open_source
-
 name: "Coverity扫描"
 params:
   product:
