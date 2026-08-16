@@ -40,7 +40,7 @@ Configure the project with CMake:
 cmake ..
 ```
 
-By default, HGGC samples are built for both `ppu_10` and `ppu_15` hardware architectures. To build for a specific architecture only, set `CMAKE_HG_ARCHITECTURES` at configure time:
+By default, HGGC samples are built for both ppu001 (`--gpu-architecture=ppu_10`) and ppu0015 (`--gpu-architecture=ppu_15`) PPU architectures. To build for a specific architecture only, set `CMAKE_HG_ARCHITECTURES` at configure time:
 
 ```
 cmake -DCMAKE_HG_ARCHITECTURES=ppu_10 ..
@@ -56,7 +56,7 @@ Run the samples from their respective subdirectories within the build directory.
 
 ### Architecture-Specific Samples
 
-A small number of samples use instructions that are only available on `ppu001` hardware. These samples are automatically built for `ppu_10` only, even when the default dual-architecture configuration is used. Their README files indicate this limitation under **Supported PPU Architectures**.
+A small number of samples use instructions that are only available on ppu001 hardware. These samples are automatically built for ppu001 (`ppu_10`) only, even when the default dual-architecture configuration is used. Their README files indicate this limitation under **Supported PPU Architectures**.
 
 ## Running All Samples with the Test Script
 
