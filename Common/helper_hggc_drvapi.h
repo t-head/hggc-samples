@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 
@@ -230,6 +231,7 @@ inline bool findFatbinPath(const char         *module_file,
         return false;
     }
     module_path = located;
+    std::free(located);
 
     if (module_path.empty()) {
         std::printf("> findModulePath could not find file: <%s> \n", module_file);
