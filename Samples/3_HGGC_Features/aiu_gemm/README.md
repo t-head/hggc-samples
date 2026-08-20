@@ -47,13 +47,19 @@ Linux
 
 x86_64
 
+## Supported PPU Architectures
+
+ppu001 only
+
+This sample uses AIU (`ppu.cp.async.aiu.*`) and Tensor Cell (`ppu.tc01.*`) instructions that are not supported on ppu0015.
+
 ## HGGC APIs and Instructions Involved
 
 ### HGGC Runtime API
 hggcMalloc, hggcMemcpy, hggcFree, hggcDeviceSynchronize
 
 ### TIX Instructions
-ppu.cp.async.aiu.bulk.tensor.shared.global, ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16, ppu.tc01.ldmatrix.swzl.m16n16.x1.trans.b16, ppu.tc01.mma.sync.aligned.m16n16k16
+ppu.cp.async.aiu.bulk.tensor.shared.global, ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16, ppu.tc01.ldmatrix.swzl.sync.aligned.m16n16.x1.trans.shared.b16, ppu.tc01.mma.sync.aligned.m16n16k16
 
 ## Prerequisites
 Please download and install the T-Head SAIL toolkit for your platform.

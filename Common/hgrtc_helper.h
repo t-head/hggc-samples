@@ -118,6 +118,7 @@ inline void compileFileToHGBIN(char *filename,
         }
 
         std::string include_path = located;
+        std::free(located);
         if (!include_path.empty()) {
             const std::size_t hit = include_path.find(headerName);
             include_path.erase(hit);

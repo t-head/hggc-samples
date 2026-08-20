@@ -32,6 +32,12 @@ Linux
 
 x86_64
 
+## Supported PPU Architectures
+
+ppu001 only
+
+This sample uses Tensor Cell instructions (`ppu.tc01.*`) that are not supported on ppu0015.
+
 ## HGGC APIs and Instructions Involved
 
 ### HGGC Runtime API

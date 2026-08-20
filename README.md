@@ -40,6 +40,12 @@ Configure the project with CMake:
 cmake ..
 ```
 
+By default, HGGC samples are built for both ppu001 (`--gpu-architecture=ppu_10`) and ppu0015 (`--gpu-architecture=ppu_15`) PPU architectures. To build for a specific architecture only, set `CMAKE_HG_ARCHITECTURES` at configure time:
+
+```
+cmake -DCMAKE_HG_ARCHITECTURES=ppu_10 ..
+```
+
 Build the samples:
 
 ```
@@ -47,6 +53,10 @@ make -j$(nproc)
 ```
 
 Run the samples from their respective subdirectories within the build directory. You may also perform the above steps from any subdirectory of the samples repository, or from an individual sample directory.
+
+### Architecture-Specific Samples
+
+A small number of samples use instructions that are only available on ppu001 hardware. These samples are automatically built for ppu001 (`ppu_10`) only, even when the default dual-architecture configuration is used. Their README files indicate this limitation under **Supported PPU Architectures**.
 
 ## Running All Samples with the Test Script
 
@@ -57,11 +67,15 @@ This Python 3 script searches for all `.out` executables in the subdirectory you
 | Switch | Purpose | Example |
 | --- | --- | --- |
 | --dir | Specifies the root directory for recursive executable search | --dir ./build |
-| --config | JSON configuration file for executable arguments (optional) | --config test_args.json |
+| --config | JSON configuration file for executable arguments (defaults to `test_args.json` if present) | --config test_args.json |
+| --no-config | Do not auto-load `test_args.json` | --no-config |
 | --output | Output directory for test results (stdout saved as .txt files; directory is created if it does not exist) | --output ./test |
 | --parallel | Number of applications to execute in parallel | --parallel 4 |
+| --arch | Target PPU architecture for architecture-aware skipping | --arch ppu0015 |
 
 Application configuration is loaded from `test_args.json` and matched against executable names.
+
+When `test_args.json` is loaded, the script detects the target PPU architecture from the Compute Capability reported by `ppu-smi -q` and skips samples whose `skip_arch` list includes that architecture. You can override the detected architecture with `--arch`. Samples that require more than one PPU are also skipped automatically when fewer devices are available.
 
 The script returns 0 on success and the first non-zero error code encountered on test failure. A summary list of failed samples is also printed if any failures occur.
 
@@ -71,6 +85,9 @@ Configuration example:
 {
     "multi_device_collab": {
         "min_ppus": 2
+    },
+    "aiu_gemm": {
+        "skip_arch": ["ppu0015"]
     }
 }
 ```
@@ -90,14 +107,20 @@ make -j$(nproc)
 Then run the test script:
 
 ```bash
-# Basic usage
+# Basic usage (auto-loads test_args.json if present)
 python3 run_tests.py --dir ./build --output ./test
 
-# With configuration file
+# Explicit configuration file
 python3 run_tests.py --dir ./build --output ./test --config test_args.json
 
 # Parallel execution
 python3 run_tests.py --dir ./build --output ./test --parallel 4
+
+# Disable configuration loading
+python3 run_tests.py --dir ./build --output ./test --no-config
+
+# Override target architecture for skip checks
+python3 run_tests.py --dir ./build --output ./test --arch ppu0015
 ```
 
 If all applications run successfully, you will see output similar to:

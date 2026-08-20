@@ -26,6 +26,10 @@ Linux
 
 x86_64
 
+## Supported PPU Architectures
+
+ppu001, ppu0015
+
 ## HGGC APIs and Instructions Involved
 
 ### HGGC Runtime API

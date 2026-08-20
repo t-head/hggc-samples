@@ -37,6 +37,10 @@ Linux
 
 x86_64
 
+## Supported PPU Architectures
+
+ppu001, ppu0015
+
 ## ACDNN APIs Involved
 
 ### ACDNN API

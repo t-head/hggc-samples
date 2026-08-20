@@ -1,4 +1,25 @@
 {
+    "aiu_gemm": {
+        "skip_arch": ["ppu0015"]
+    },
+    "aiu_async_copy": {
+        "skip_arch": ["ppu0015"]
+    },
+    "aiu_throughput": {
+        "skip_arch": ["ppu0015"]
+    },
+    "bf16_tensor_cell_gemm": {
+        "skip_arch": ["ppu0015"]
+    },
+    "imma_tensor_cell_gemm": {
+        "skip_arch": ["ppu0015"]
+    },
+    "tf32_tensor_cell_gemm": {
+        "skip_arch": ["ppu0015"]
+    },
+    "transpose": {
+        "skip_arch": ["ppu0015"]
+    },
     "multi_device_collab": {
         "min_ppus": 2
     }

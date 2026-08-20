@@ -94,14 +94,15 @@ static const char *func_src =
 
 /* Compile source to LTO IR (for cross-module optimization at link time) */
 static void compile_to_lto_ir(const char *src, const char *name,
+                              const char *ppu_arch_opt,
                               char **ir_out, size_t *size_out)
 {
     hgrtcProgram prog;
     HGRTC_CHECK("hgrtcCreateProgram",
                 hgrtcCreateProgram(&prog, src, name, 0, NULL, NULL));
 
-    const char *opts[] = {"-dlto", "--relocatable-device-code=true"};
-    hgrtcResult rc = hgrtcCompileProgram(prog, 2, opts);
+    const char *opts[] = {"-dlto", "--relocatable-device-code=true", ppu_arch_opt};
+    hgrtcResult rc = hgrtcCompileProgram(prog, 3, opts);
 
     /* Print compilation log */
     size_t log_sz;
@@ -125,6 +126,7 @@ static void compile_to_lto_ir(const char *src, const char *name,
 
 /* Compile source to HGBIN (regular compilation, no LTO) */
 static void compile_to_hgbin(const char *src, const char *name,
+                             const char *ppu_arch_opt,
                              char **bin_out, size_t *size_out)
 {
     hgrtcProgram prog;
@@ -132,8 +134,8 @@ static void compile_to_hgbin(const char *src, const char *name,
                 hgrtcCreateProgram(&prog, src, name, 0, NULL, NULL));
 
     /* No -dlto, but with RDC for cross-module symbol visibility */
-    const char *opts[] = {"--relocatable-device-code=true"};
-    hgrtcResult rc = hgrtcCompileProgram(prog, 1, opts);
+    const char *opts[] = {"--relocatable-device-code=true", ppu_arch_opt};
+    hgrtcResult rc = hgrtcCompileProgram(prog, 2, opts);
 
     size_t log_sz;
     HGRTC_CHECK("hgrtcGetProgramLogSize", hgrtcGetProgramLogSize(prog, &log_sz));
@@ -166,20 +168,8 @@ int main(int argc, char *argv[])
     if (hgJitLinkVersion(&version) == HGJITLINK_SUCCESS)
         std::cout << "  JitLink version: " << version << "\n\n";
 
-    /* ── Step 1: Compile both modules ── */
-    std::cout << "Step 1: Compiling modules\n";
-    char *lto_ir;
-    size_t lto_ir_size;
-    compile_to_lto_ir(kernel_src, "weighted_average.hg", &lto_ir, &lto_ir_size);
-    std::cout << "  Module A (LTO IR): " << lto_ir_size << " bytes\n";
-
-    char *hgbin;
-    size_t hgbin_size;
-    compile_to_hgbin(func_src, "blend.hg", &hgbin, &hgbin_size);
-    std::cout << "  Module B (HGBIN):  " << hgbin_size << " bytes\n\n";
-
-    /* ── Step 2: Initialize device ── */
-    std::cout << "Step 2: Initialize device\n";
+    /* ── Step 1: Initialize device and detect target architecture ── */
+    std::cout << "Step 1: Initialize device\n";
     CHECK_HG(hgInit(0));
 
     HGdevice device;
@@ -191,13 +181,27 @@ int main(int argc, char *argv[])
     CHECK_HG(hgDeviceGetAttribute(&minor,
         HG_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
 
-    const char *arch = "ppu001";
+    const char *ppu_arch = "ppu001";
     int cc = major * 10 + minor;
-    if (cc == 89) arch = "ppu0015";
+    if (cc == 89) ppu_arch = "ppu0015";
 
-    char arch_opt[32];
-    snprintf(arch_opt, sizeof(arch_opt), "--arch=%s", arch);
-    std::cout << "  Target arch: " << arch << " (cc " << major << "." << minor << ")\n\n";
+    char ppu_arch_opt[32];
+    char jitlink_arch_opt[32];
+    snprintf(ppu_arch_opt, sizeof(ppu_arch_opt), "--ppu-arch=%s", ppu_arch);
+    snprintf(jitlink_arch_opt, sizeof(jitlink_arch_opt), "--arch=%s", ppu_arch);
+    std::cout << "  Target arch: " << ppu_arch << " (cc " << major << "." << minor << ")\n\n";
+
+    /* ── Step 2: Compile both modules for the detected architecture ── */
+    std::cout << "Step 2: Compiling modules\n";
+    char *lto_ir;
+    size_t lto_ir_size;
+    compile_to_lto_ir(kernel_src, "weighted_average.hg", ppu_arch_opt, &lto_ir, &lto_ir_size);
+    std::cout << "  Module A (LTO IR): " << lto_ir_size << " bytes\n";
+
+    char *hgbin;
+    size_t hgbin_size;
+    compile_to_hgbin(func_src, "blend.hg", ppu_arch_opt, &hgbin, &hgbin_size);
+    std::cout << "  Module B (HGBIN):  " << hgbin_size << " bytes\n\n";
 
     /* ── Step 3: Mixed linking (LTO IR + HGBIN) ── */
     std::cout << "Step 3: Linking LTO IR + HGBIN\n";
@@ -209,7 +213,7 @@ int main(int argc, char *argv[])
 #endif
 
     hgJitLinkHandle handle;
-    const char *link_opts[] = {"-lto", arch_opt};
+    const char *link_opts[] = {"-lto", jitlink_arch_opt};
     CHECK_JIT(handle, hgJitLinkCreate(&handle, 2, link_opts));
 
     /* Add Module A as LTO IR */
