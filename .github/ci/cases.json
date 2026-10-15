@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "architecture": "ppu_10",
+  "samples": [
+    {
+      "source": "Samples/1_Utilities/device_query",
+      "binary_dir": "device_query",
+      "cases": [
+        {
+          "target": "device_query",
+          "success": "Result = PASS",
+          "description": "Runtime API device discovery and capability query",
+          "assets": []
+        }
+      ]
+    },
+    {
+      "source": "Samples/0_Introduction/vector_add",
+      "binary_dir": "vector_add",
+      "cases": [
+        {
+          "target": "vector_add",
+          "success": "Result: PASS",
+          "description": "Runtime API kernel launch and result verification",
+          "assets": []
+        },
+        {
+          "target": "vector_add_driver_api",
+          "success": "Result: PASS",
+          "description": "Driver API module loading from an offline fatbin",
+          "assets": [
+            "driver_api_kernel64.fatbin"
+          ]
+        },
+        {
+          "target": "vector_add_runtime_compile",
+          "success": "Result: PASS",
+          "description": "HGRTC runtime compilation and Driver API launch",
+          "assets": [
+            "runtime_compile_kernel.hg"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "Samples/0_Introduction/atomic_intrinsics",
+      "binary_dir": "atomic_intrinsics",
+      "cases": [
+        {
+          "target": "atomic_intrinsics_static",
+          "success": "completed, returned OK",
+          "description": "Atomic operations with asynchronous stream copies",
+          "assets": []
+        },
+        {
+          "target": "atomic_intrinsics_hgrtc",
+          "success": "completed, returned OK",
+          "description": "Atomic operations compiled at runtime with HGRTC",
+          "assets": [
+            "atomic_kernel.hgh",
+            "atomic_kernel_rtc.hg"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "Samples/3_HGGC_Features/simple_hggc_graphs",
+      "binary_dir": "simple_hggc_graphs",
+      "cases": [
+        {
+          "target": "simple_hggc_graphs",
+          "success": "Result: PASS",
+          "description": "Graph construction, cloning, child graphs, and execution",
+          "assets": []
+        }
+      ]
+    }
+  ]
+}
