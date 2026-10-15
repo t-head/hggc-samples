@@ -2,28 +2,29 @@ name: CI Pipeline
 
 on:
   pull_request:
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-  # The reusable review gates poll while they run. This event also recovers a
-  # workflow that timed out before Copilot or a human submitted their review.
-  pull_request_review:
-    types: [submitted]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   precheck:
     name: Pre-check
+    if: github.event_name == 'pull_request'
     uses: t-head/.github/.github/workflows/user-precheck.yml@main
 
   smoke-test:
     name: Smoke Test
     needs: precheck
+    if: ${{ always() && (github.event_name == 'push' || needs.precheck.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -36,8 +37,8 @@ jobs:
       - name: Validate CI configuration
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           bash -n .github/ci/run_device_tests.sh
@@ -48,12 +49,14 @@ jobs:
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck
+    if: github.event_name == 'pull_request'
     uses: t-head/.github/.github/workflows/ai-code-review.yml@main
     secrets: inherit
 
   ci:
     name: Full CI
     needs: [smoke-test, ai-code-review]
+    if: ${{ always() && needs.smoke-test.result == 'success' && (github.event_name == 'push' || needs.ai-code-review.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -171,12 +174,14 @@ jobs:
   human-review:
     name: Human Review Gate
     needs: ci
+    if: github.event_name == 'pull_request'
     uses: t-head/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
   ppu-test:
     name: PPU Device Tests (810E)
     needs: [ci, human-review]
+    if: ${{ always() && needs.ci.result == 'success' && (github.event_name == 'push' || needs.human-review.result == 'success') }}
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
