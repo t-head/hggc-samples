@@ -1,0 +1,209 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # The reusable review gates poll while they run. This event also recovers a
+  # workflow that timed out before Copilot or a human submitted their review.
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  precheck:
+    name: Pre-check
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+
+  smoke-test:
+    name: Smoke Test
+    needs: precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate CI configuration
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          bash -n .github/ci/run_device_tests.sh
+          python3 -m py_compile run_tests.py .github/ci/check_cases.py
+          python3 .github/ci/check_cases.py
+          git diff --check "${BASE_SHA}" "${HEAD_SHA}"
+
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: t-head/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  ci:
+    name: Full CI
+    needs: [smoke-test, ai-code-review]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Keep this installer and the 810E image in ppu-test on the same SDK
+      # release so that binaries are compiled and run against a compatible ABI.
+      PPU_SDK_URL: https://download.t-head.cn/artifactory/ptgai-generic-release/PPU_SDK/v2.2.0/ppu_hggcrt3_ubuntu2404-2.2.0-663c22.run
+      PPU_SDK_SHA256: 77353c4828f72b056ec736677cf5ccb464bc97ff4f7b6dda2574d58c6f0cb0c5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Ninja
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ninja >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ninja-build
+          fi
+          cmake --version
+          ninja --version
+
+      - name: Download and install PPU SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="${RUNNER_TEMP}/${PPU_SDK_URL##*/}"
+          curl --fail --location --retry 3 --retry-delay 5 \
+            --output "${installer}" "${PPU_SDK_URL}"
+          echo "${PPU_SDK_SHA256}  ${installer}" | sha256sum --check
+          sudo bash "${installer}" --prefix=/usr/local/ --silent
+          rm -f "${installer}"
+
+          sdk_dir=/usr/local/PPU_SDK
+          if [[ ! -f "${sdk_dir}/envsetup.sh" ]]; then
+            sdk_env=$(sudo find /usr/local -maxdepth 3 -type f \
+              -name envsetup.sh \
+              ! -path '*/ppu-smi/*' \
+              ! -path '*/asight/*' \
+              -print -quit)
+            if [[ -n "${sdk_env}" ]]; then
+              sdk_dir=$(dirname "${sdk_env}")
+            fi
+          fi
+
+          if [[ ! -f "${sdk_dir}/envsetup.sh" ]]; then
+            echo "PPU SDK envsetup.sh not found under /usr/local" >&2
+            sudo find /usr/local -maxdepth 2 -type d -print
+            exit 1
+          fi
+
+          {
+            echo "PPU_SDK=${sdk_dir}"
+            echo "PPU_PATH=${sdk_dir}"
+            echo "PPU_HOME=${sdk_dir}"
+          } >> "${GITHUB_ENV}"
+          echo "PPU_SDK=${sdk_dir}"
+
+      - name: Build allowlisted 810E cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +u
+          source "${PPU_SDK}/envsetup.sh" || true
+          set -u
+          "${PPU_SDK}/bin/hgcc" --version
+          python3 .github/ci/check_cases.py
+
+          build_dir="${RUNNER_TEMP}/hggc-samples-ci"
+          cmake -G Ninja \
+            -S .github/ci \
+            -B "${build_dir}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_HG_ARCHITECTURES=ppu_10
+          cmake --build "${build_dir}" \
+            --target hggc_ci_cases \
+            --parallel "$(nproc)"
+
+      - name: Pack and validate device cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_dir="${RUNNER_TEMP}/hggc-samples-ci"
+          archive="${RUNNER_TEMP}/hggc-samples-810e.tar.gz"
+
+          # upload-artifact does not preserve executable modes, so transfer one
+          # tarball containing only the selected binaries and runtime assets.
+          tar -czf "${archive}" -C "${build_dir}" bin ci-cases.tsv
+          bash .github/ci/run_device_tests.sh --validate-only "${archive}"
+          ls -lh "${archive}"
+
+      - name: Upload device cases
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hggc-samples-810e
+          path: ${{ runner.temp }}/hggc-samples-810e.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 7
+
+      - name: Upload build logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hggc-samples-ci-logs
+          path: |
+            ${{ runner.temp }}/hggc-samples-ci/CMakeFiles/*.log
+            ${{ runner.temp }}/hggc-samples-ci/CMakeFiles/*.yaml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  human-review:
+    name: Human Review Gate
+    needs: ci
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  ppu-test:
+    name: PPU Device Tests (810E)
+    needs: [ci, human-review]
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download device cases
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: hggc-samples-810e
+          path: device-cases
+
+      - name: Run allowlisted cases on PPU (810E)
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
+          namespace: ppu-sched
+          timeout_minutes: 60
+          command: |
+            set -e
+            cd /workspace/source
+            bash .github/ci/run_device_tests.sh \
+              device-cases/hggc-samples-810e.tar.gz
