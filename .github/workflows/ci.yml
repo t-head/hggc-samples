@@ -199,12 +199,12 @@ jobs:
           path: device-cases
 
       - name: Run allowlisted cases on PPU (810E)
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
           nnodes: 0
           nproc_per_node: 1
-          node_selector: "board-type=OAM-810E"
+          node_selector: "board-type=ZW-810E"
           namespace: ppu-sched
           timeout_minutes: 60
           command: |
