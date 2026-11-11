@@ -22,8 +22,8 @@ hggcGetDeviceCount, hggcSetDevice, hggcDeviceGetAttribute, hggcStreamCreateWithF
 
 ## Runtime Signature Differences
 
-- SAIL 2.2.0 rt2: 9 parameters, with `void **dsts`, `void **srcs`, `size_t *sizes`, and `size_t *failIdx`.
-- SAIL 2.2.0 rt3: 8 parameters, with `void *const *dsts`, `const void *const *srcs`, and `const size_t *sizes`, without `failIdx`.
+- SAIL 2.2.1 rt2: 9 parameters, with `void **dsts`, `void **srcs`, `size_t *sizes`, and `size_t *failIdx`.
+- SAIL 2.2.1 rt3: 8 parameters, with `void *const *dsts`, `const void *const *srcs`, and `const size_t *sizes`, without `failIdx`.
 - Overloads are selected by the actual function-pointer type. The rt3 path constructs a separate const source-pointer array instead of casting `void **`. It does not report a nonexistent failure index on error. Stream synchronization must also be checked for asynchronous errors.
 
 ## Prerequisites

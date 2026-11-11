@@ -2,14 +2,14 @@
 
 # HGGC Sample Programs
 
-HGGC-Samples is a collection of sample programs for HGGC developers, demonstrating features of the T-Head SAIL toolkit. The current version supports SAIL 2.2.0.
+HGGC-Samples is a collection of sample programs for HGGC developers, demonstrating features of the T-Head SAIL toolkit. The current version supports SAIL 2.2.1.
 
-Compared with SAIL 2.1.0, this version adds `memcpy_batch_async` (batched asynchronous D2D copies) and `array_roundtrip` (1D/2D/3D array round-trip verification).
+Compared with SAIL 2.2.0, this version adds `acdnn_softmax_bf16` (BF16 softmax correctness verification).
 
-## SAIL 2.2.0 Sample Coverage
+## SAIL 2.2.1 Sample Coverage
 
-- Seven AIU/TIX samples provide architecture-specific implementations for ppu001 and ppu0015.
-- The existing `atomic_intrinsics` sample covers ULL atomic operations in both static and HGRTC paths; `graph_memory_nodes` covers explicit graph upload as well as ordinary launch.
+- This version includes the SAIL 2.2.0 `memcpy_batch_async` and `array_roundtrip` samples, ULL atomic checks, graph upload checks, and seven architecture-specific AIU/TIX implementations for ppu001 and ppu0015.
+- See [acdnn_softmax_bf16](Samples/4_HGGC_Libraries/acdnn_softmax_bf16/README.md) for its configuration, quantized-input CPU reference, and fixed tolerances. This sample requires SAIL 2.2.1 and the corresponding ACDNN library.
 - A new sample does not imply that its APIs were first introduced in this version.
 
 # Prerequisites
