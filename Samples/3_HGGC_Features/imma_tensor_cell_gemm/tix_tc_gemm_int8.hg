@@ -10,7 +10,7 @@
  * tix_tc_gemm_int8 -- INT8 GEMM via TIX Tensor Cell (Double-Buffer)
  *
  * Integer matrix multiply D = A*B (int8 inputs, int32 accumulate)
- * using ppu.tc01.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32.
+ * using the architecture-specific tc01/tc02 m16n16k32 INT8 MMA instruction.
  *
  * Algorithm: tiled GEMM with double-buffered shared memory staging.
  *   - Each block computes a 16x16 output tile (one warp per tile)
@@ -23,8 +23,8 @@
  *   - K-tile = 32 (largest K per MMA instruction)
  *   - A/B stored as int8 (1 byte per element)
  *   - A tile: 16x32 = 512 bytes, B tile: 32x16 = 512 bytes
- *   - B uses ldmatrix.m16n16.x2.diagswap.trans.b8 (requires paired K-half smem)
- *   - C/D fragments: 8 x .s32 registers (same layout as bf16/tf32)
+ *   - B uses paired K-half smem layout: tc01 uses diagswap.trans.b8; tc02 uses trans.b8 and swaps B1/B2.
+ *   - C/D use eight .s32 registers with the same position mapping as BF16/TF32 on the same architecture.
  *
  * Matrix dimensions: M=N=K=256 (configurable via constants)
  */
@@ -37,6 +37,14 @@
 #include <hggc_runtime.h>
 #include <helper_hggc.h>
 #include <helper_functions.h>
+
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+#define TIX_TC_PREFIX "ppu.tc02"
+#define TIX_INT8_LOAD_B "ppu.tc02.ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 "
+#else
+#define TIX_TC_PREFIX "ppu.tc01"
+#define TIX_INT8_LOAD_B "ppu.tc01.ldmatrix.sync.aligned.m16n16.x2.diagswap.trans.shared.b8 "
+#endif
 
 namespace {
 constexpr int M_GLOBAL = 256;
@@ -130,39 +138,50 @@ __global__ void tix_tc_gemm_int8_kernel(
 
         // Load A fragment: m8n8.x4.b16
         {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+            int base_row = lane % 16;
+            int base_col = (lane / 16) * 16;
+#else
             int sub = lane / 8;
             int row_in_sub = lane % 8;
             int base_row = (sub / 2) * 8 + row_in_sub;
             int base_col = (sub % 2) * 16;
+#endif
             unsigned int addr_a;
             CVTA_TO_SHARED(addr_a, &smem_a[cur][0]);
             addr_a += base_row * TILE_K + base_col;
-            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.b16 "
+            asm volatile(TIX_TC_PREFIX ".ldmatrix.sync.aligned.m8n8.x4.b16 "
                          "{%0, %1, %2, %3}, [%4];"
                          : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
                          : "r"(addr_a));
         }
 
-        // Load B fragment: m16n16.x2.diagswap.trans.b8
+        // Transposed B load: tc01 uses diagswap; tc02 swaps B1/B2 after loading.
         {
             unsigned int addr_b;
             CVTA_TO_SHARED(addr_b, &smem_b[cur][0]);
             addr_b += (lane % 16) * 32 + (lane / 16) * 16;
-            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m16n16.x2.diagswap.trans.shared.b8 "
+            asm volatile(TIX_INT8_LOAD_B
                          "{%0, %1, %2, %3}, [%4];"
                          : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
                          : "r"(addr_b));
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+            // The b8 x2 transpose first emits two column fragments of the same 16x16 cell; MMA consumes them in K-half order.
+            unsigned int tmp = b1;
+            b1 = b2;
+            b2 = tmp;
+#endif
         }
 
         // MMA: m16n16k32 int8
         asm volatile(
-            "ppu.tc01.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
+            TIX_TC_PREFIX ".mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3,%4,%5,%6,%7}, "
             "{%8,%9,%10,%11}, "
             "{%12,%13,%14,%15}, "
             "{%16,%17,%18,%19,%20,%21,%22,%23};"
-            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
-              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3),
+              "=r"(c4), "=r"(c5), "=r"(c6), "=r"(c7)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
               "r"(b0), "r"(b1), "r"(b2), "r"(b3),
               "r"(c0), "r"(c1), "r"(c2), "r"(c3),
@@ -178,14 +197,19 @@ __global__ void tix_tc_gemm_int8_kernel(
         __syncthreads();
 
         {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+            int base_row = lane % 16;
+            int base_col = (lane / 16) * 16;
+#else
             int sub = lane / 8;
             int row_in_sub = lane % 8;
             int base_row = (sub / 2) * 8 + row_in_sub;
             int base_col = (sub % 2) * 16;
+#endif
             unsigned int addr_a;
             CVTA_TO_SHARED(addr_a, &smem_a[cur][0]);
             addr_a += base_row * TILE_K + base_col;
-            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m8n8.x4.b16 "
+            asm volatile(TIX_TC_PREFIX ".ldmatrix.sync.aligned.m8n8.x4.b16 "
                          "{%0, %1, %2, %3}, [%4];"
                          : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
                          : "r"(addr_a));
@@ -195,20 +219,26 @@ __global__ void tix_tc_gemm_int8_kernel(
             unsigned int addr_b;
             CVTA_TO_SHARED(addr_b, &smem_b[cur][0]);
             addr_b += (lane % 16) * 32 + (lane / 16) * 16;
-            asm volatile("ppu.tc01.ldmatrix.sync.aligned.m16n16.x2.diagswap.trans.shared.b8 "
+            asm volatile(TIX_INT8_LOAD_B
                          "{%0, %1, %2, %3}, [%4];"
                          : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
                          : "r"(addr_b));
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+            // The b8 x2 transpose first emits two column fragments of the same 16x16 cell; MMA consumes them in K-half order.
+            unsigned int tmp = b1;
+            b1 = b2;
+            b2 = tmp;
+#endif
         }
 
         asm volatile(
-            "ppu.tc01.mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
+            TIX_TC_PREFIX ".mma.sync.aligned.m16n16k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3,%4,%5,%6,%7}, "
             "{%8,%9,%10,%11}, "
             "{%12,%13,%14,%15}, "
             "{%16,%17,%18,%19,%20,%21,%22,%23};"
-            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3),
-              "+r"(c4), "+r"(c5), "+r"(c6), "+r"(c7)
+            : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3),
+              "=r"(c4), "=r"(c5), "=r"(c6), "=r"(c7)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
               "r"(b0), "r"(b1), "r"(b2), "r"(b3),
               "r"(c0), "r"(c1), "r"(c2), "r"(c3),
@@ -216,11 +246,23 @@ __global__ void tix_tc_gemm_int8_kernel(
     }
 
     // ---- Store results to global memory ----
-    // C/D layout same as bf16/tf32 (8 sub-matrices of 8x4)
+    // C/D match BF16/TF32 on the same architecture; write-back order differs between tc01 and tc02.
     int32_t *d_base = D + tile_row * TILE_M * N + tile_col * TILE_N;
     const int r_blk = lane / 4;
     const int c_blk = lane % 4;
 
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+    // The tc02 INT8 MMA uses the same C/D position mapping as the floating-point MMA.
+    const int col = c_blk * 2;
+    d_base[r_blk * N + col]           = c0;
+    d_base[r_blk * N + col + 1]       = c1;
+    d_base[(8 + r_blk) * N + col]     = c2;
+    d_base[(8 + r_blk) * N + col + 1] = c3;
+    d_base[r_blk * N + col + 8]       = c4;
+    d_base[r_blk * N + col + 9]       = c5;
+    d_base[(8 + r_blk) * N + col + 8] = c6;
+    d_base[(8 + r_blk) * N + col + 9] = c7;
+#else
     d_base[(r_blk) * N + (c_blk + 0)]      = c0;
     d_base[(r_blk) * N + (c_blk + 4)]      = c1;
     d_base[(r_blk) * N + (c_blk + 8)]      = c2;
@@ -229,10 +271,14 @@ __global__ void tix_tc_gemm_int8_kernel(
     d_base[(8 + r_blk) * N + (c_blk + 4)]  = c5;
     d_base[(8 + r_blk) * N + (c_blk + 8)]  = c6;
     d_base[(8 + r_blk) * N + (c_blk + 12)] = c7;
+#endif
 
     #undef ASYNC_COPY_TILE
     #undef CVTA_TO_SHARED
 }
+
+#undef TIX_INT8_LOAD_B
+#undef TIX_TC_PREFIX
 
 // ═══════════════════════════════════════════════════════════════════════
 // CPU reference

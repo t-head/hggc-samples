@@ -1,16 +1,16 @@
 # 5. Performance
 
-### aligned_types
-A simple test demonstrating the large access speed gap between aligned and misaligned structures. It measures per-element copy throughput of aligned and misaligned structures on large data blocks.
+### aiu_throughput
+Compares cp.async and architecture-specific AIU bulk tensor copies for BF16 tensors from 2KB to 32KB, verifies data integrity, and reports throughput and speedup.
 
 ### hggc_graphs_perf_scaling
 This sample analyzes the performance characteristics of the HGGC Graph API across different graph sizes. It focuses on how the API scales with graph size.
 
-### large_kernel_parameter
-A simple test demonstrating performance and usability improvements for large kernel parameters introduced in HGGC.
+### mem_strategy_bench
+Compares managed memory with prefetch, mapped zero-copy memory, pinned asynchronous transfers, and pageable synchronous transfers for an elementwise scale kernel over multiple data sizes.
+
+### smem_bank_conflict
+Measures shared-memory read throughput with strides from 1 to 32 to demonstrate the impact of bank conflicts, reporting effective throughput and relative efficiency.
 
 ### transpose
-This sample demonstrates matrix transpose. It showcases different performance optimizations to achieve high performance.
-
-### unified_memory_perf
-This sample demonstrates performance comparison of unified memory (with/without hints) versus other memory types (such as zero-copy buffers, pageable memory, page-locked memory) for synchronous and asynchronous transfers on a single PPU using a matrix multiplication kernel.
+Compares native shared-memory tiling, architecture-specific AIU+ldmatrix, and producer-consumer AIU pipeline transposes for BF16 square matrices, verifying results and reporting throughput.

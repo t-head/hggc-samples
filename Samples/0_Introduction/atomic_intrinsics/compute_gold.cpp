@@ -47,9 +47,10 @@ extern "C" bool computeGold(int *ppuData, const int len) {
         if (!check_eq(ppuData, kSlotAnd, seed, "atomicAnd")) return false;
     }
     {
-        int seed = 0;
-        for (int i = 0; i < len; ++i) seed |= (1 << i);
-        if (!check_eq(ppuData, kSlotOr, seed, "atomicOr")) return false;
+        unsigned int seed = 0;
+        for (int i = 0; i < len; ++i) seed |= (1u << (i % 32));
+        if (static_cast<unsigned int>(ppuData[kSlotOr]) != seed)
+            return report_mismatch("atomicOr");
     }
     {
         int seed = ATOMIC_BITWISE_SEED;
@@ -87,4 +88,52 @@ extern "C" bool computeGold(int *ppuData, const int len) {
     if (!check_member(ppuData, kSlotCas, len, "atomicCAS")) return false;
 
     return true;
+}
+
+bool computeUllGold(const UllResults &results) {
+    unsigned long long expected[kUllSlotCount] = {
+        kUllBase, ~0ULL, 0, kUllSeed, ~0ULL, 0, 0, kUllBase};
+    for (unsigned int tid = 0; tid < kUllThreads; ++tid) {
+        expected[kUllAdd] += kUllIncrement;
+        expected[kUllAnd] &= ~(1ULL << (tid % 64));
+        expected[kUllOr] |= 1ULL << (tid % 64);
+        expected[kUllXor] ^= kUllBase | tid;
+        expected[kUllMin] = std::min(expected[kUllMin], kUllBase + tid);
+        expected[kUllMax] = std::max(expected[kUllMax], kUllBase + tid);
+    }
+    unsigned long long value = kUllSeed;
+    unsigned long long old[kUllOldCount];
+    old[0] = value; value += kUllIncrement;
+    old[1] = value; value &= kUllMask;
+    old[2] = value; value |= kUllOrBits;
+    old[3] = value; value ^= kUllXorBits;
+    old[4] = value; value = std::min(value, kUllBase);
+    old[5] = value; value = std::max(value, kUllSeed);
+    old[6] = value; value = kUllBase;
+    old[7] = value; value = kUllSeed;
+    old[8] = value;
+    bool ok = true;
+    for (int space = 0; space < 2; ++space) {
+        for (int slot = 0; slot < kUllSlotCount; ++slot) {
+            const auto actual = results.concurrent[space][slot];
+            const bool match = slot == kUllExch
+                ? actual >= kUllBase && actual < kUllBase + kUllThreads
+                : actual == expected[slot];
+            if (!match) {
+                std::printf("ULL concurrent space=%d slot=%d got=%016llx expected=%016llx\n",
+                            space, slot, actual, expected[slot]);
+                ok = false;
+            }
+        }
+        for (int step = 0; step < kUllOldCount; ++step) {
+            if (results.old[space][step] != old[step]) {
+                std::printf("ULL old-value space=%d step=%d got=%016llx expected=%016llx\n",
+                            space, step, results.old[space][step], old[step]);
+                ok = false;
+            }
+        }
+        if (results.final[space] != value) ok = false;
+    }
+    std::printf("ULL global/shared concurrent and old-value: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
 }

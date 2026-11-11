@@ -98,16 +98,30 @@ __global__ void aiu_bulk_copy_kernel(
     /* Phase 1: AIU async copy (global → shared, swizzle 128B) */
     if (warpIdx < n_warps && lane == 0) {
         int start_h = warpIdx * TILE_H;
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+        unsigned long long tensor_stride_w = MAT_C * sizeof(uint16_t);
+        unsigned long long tensor_stride_n = big_h * tensor_stride_w;
+        asm volatile(
+            "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.padz.swzl.b16"
+            " [%0], [%1],"
+            " {%2, %3, %4}, {%5, %6, %7},"
+            " {%8, %9}, {%10, %11, %12}, %13;"
+            :: "r"(my_smem_addr), "l"(input),
+               "r"(MAT_C), "r"(big_h), "r"(1),
+               "r"(MAT_C), "r"(TILE_H), "r"(1),
+               "l"(tensor_stride_w), "l"(tensor_stride_n),
+               "r"(0), "r"(start_h), "r"(0), "r"(0));
+#else
         asm volatile(
             "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
             " [%0], [%1],"
             " {%2, %3, %4, %5, %6, %7},"
             " {%8, %9, %10, %11};"
             :: "r"(my_smem_addr), "l"(input),
-               "r"(big_h),  "r"(1), "r"(MAT_C),
+               "r"(big_h), "r"(1), "r"(MAT_C),
                "r"(start_h), "r"(0), "r"(0),
-               "r"(TILE_H), "r"(1), "r"(MAT_C),
-               "r"(1));
+               "r"(TILE_H), "r"(1), "r"(MAT_C), "r"(1));
+#endif
         asm volatile("ppu.cp.async.commit_group;");
         asm volatile("ppu.cp.async.wait_group 0;");
     }
@@ -119,6 +133,18 @@ __global__ void aiu_bulk_copy_kernel(
     #pragma unroll
     for (int iter = 0; iter < N_LDMATRIX; ++iter) {
         int ch_off = iter * 32;
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+        unsigned int matrix_addr = (my_smem_addr + ch_off) >> 4;
+        asm volatile(
+            "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.shared.b16"
+            " {%0, %1, %2, %3}, [%4], %5, %6, %7;"
+            : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
+              "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
+            : "r"(matrix_addr), "r"(1), "r"(64), "r"(0));
+        unsigned int tmp = frag[iter*4+1];
+        frag[iter*4+1] = frag[iter*4+2];
+        frag[iter*4+2] = tmp;
+#else
         asm volatile(
             "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
             " {%0, %1, %2, %3}, [%4],"
@@ -126,8 +152,8 @@ __global__ void aiu_bulk_copy_kernel(
             : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
               "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
             : "r"(my_smem_addr),
-              "r"(0), "r"(0), "r"(TILE_H), "r"(1),
-              "r"(1), "r"(ch_off));
+              "r"(0), "r"(0), "r"(TILE_H), "r"(1), "r"(1), "r"(ch_off));
+#endif
     }
 
     /* Phase 3: Store fragments to global output */

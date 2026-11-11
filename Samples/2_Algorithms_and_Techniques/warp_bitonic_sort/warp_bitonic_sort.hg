@@ -106,6 +106,8 @@ __global__ void block_bitonic_sort_kernel(int *data, int n)
 
             int my_val = s_data[threadIdx.x];
             int partner_val = s_data[partner];
+            // All threads must read the old values before any write-back, avoiding cross-warp read/write races.
+            __syncthreads();
 
             bool ascending_dir = ((threadIdx.x >> stage) & 1) == 0;
             bool is_lower = (threadIdx.x & mask) == 0;

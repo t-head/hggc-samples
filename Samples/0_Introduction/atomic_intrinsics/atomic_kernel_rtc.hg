@@ -7,6 +7,7 @@
  * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
  * under the Apache License 2.0 for reference and educational purposes.
  */
+#define ATOMIC_DEVICE_CODE
 #include "atomic_kernel.hgh"
 
 extern "C" __global__ void atomic_op_suite(int *slots)
@@ -15,7 +16,7 @@ extern "C" __global__ void atomic_op_suite(int *slots)
 
     /// Bitwise group.
     atomicAnd(&slots[kSlotAnd], 2 * tid + 7);
-    atomicOr (&slots[kSlotOr],  1 << tid);
+    atomicOr(reinterpret_cast<unsigned int *>(&slots[kSlotOr]), 1u << (tid % 32));
     atomicXor(&slots[kSlotXor], tid);
 
     /// Arithmetic group.

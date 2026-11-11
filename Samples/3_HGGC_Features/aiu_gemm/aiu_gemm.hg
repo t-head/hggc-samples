@@ -15,8 +15,8 @@
  *   - A: (M×64) tensor per K-group, dim_h=M, cube_h=16, start_h=tile_row*16
  *   - B: (64×64) tensor per (kg,ng), dim_h=64, cube_h=16, start_h=kt*16
  *   - AIU .swzl + ldmatrix.swzl for both A and B
- *   - B stored row-major, m16n16.x1.trans → column-major for MMA .col
- *   - MMA: ppu.tc01.mma.m16n16k16.row.col.f32.f16.f16.f32 (fp16 inputs, fp32 accumulate)
+ *   - B stays row-major; tc01 uses m16n16.x1.trans and tc02 uses m8n8.x4.trans to produce the MMA .col fragment.
+ *   - MMA: ppu.tc01/tc02.mma.m16n16k16.row.col.f32.f16.f16.f32 (fp16 inputs, fp32 accumulate)
  */
 #include <cmath>
 #include <cstdio>
@@ -27,6 +27,12 @@
 #include "hggc_fp16.h"
 #include <helper_hggc.h>
 #include <helper_functions.h>
+
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+#define TIX_TC_PREFIX "ppu.tc02"
+#else
+#define TIX_TC_PREFIX "ppu.tc01"
+#endif
 
 namespace {
 
@@ -80,6 +86,20 @@ __global__ void aiu_gemm_kernel(
         const __half *b_tensor = B_retiled + (size_t)(kg * N_N_GROUPS + ng) * K_GROUP * N_GROUP;
 
         if (lane == 0) {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+            unsigned long long tensor_stride_w = K_GROUP * sizeof(__half);
+            unsigned long long tensor_stride_n = M_GLOBAL * tensor_stride_w;
+            asm volatile(
+                "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.padz.swzl.b16"
+                " [%0], [%1],"
+                " {%2, %3, %4}, {%5, %6, %7},"
+                " {%8, %9}, {%10, %11, %12}, %13;"
+                :: "r"(smem_a_addr), "l"(a_tensor),
+                   "r"(K_GROUP), "r"(M_GLOBAL), "r"(1),
+                   "r"(K_GROUP), "r"(TILE_M), "r"(1),
+                   "l"(tensor_stride_w), "l"(tensor_stride_n),
+                   "r"(0), "r"(tile_row * TILE_M), "r"(0), "r"(0));
+#else
             asm volatile(
                 "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
                 " [%0], [%1],"
@@ -89,10 +109,25 @@ __global__ void aiu_gemm_kernel(
                    "r"(M_GLOBAL), "r"(1), "r"(K_GROUP),
                    "r"(tile_row * TILE_M), "r"(0), "r"(0),
                    "r"(TILE_M), "r"(1), "r"(K_GROUP), "r"(1));
+#endif
         }
 
         for (int kt = 0; kt < K_GROUP / TILE_K; ++kt) {
             if (lane == 0) {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+                unsigned long long tensor_stride_w = N_GROUP * sizeof(__half);
+                unsigned long long tensor_stride_n = K_GROUP * tensor_stride_w;
+                asm volatile(
+                    "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.padz.swzl.b16"
+                    " [%0], [%1],"
+                    " {%2, %3, %4}, {%5, %6, %7},"
+                    " {%8, %9}, {%10, %11, %12}, %13;"
+                    :: "r"(smem_b_addr), "l"(b_tensor),
+                       "r"(N_GROUP), "r"(K_GROUP), "r"(1),
+                       "r"(N_GROUP), "r"(TILE_K), "r"(1),
+                       "l"(tensor_stride_w), "l"(tensor_stride_n),
+                       "r"(0), "r"(kt * TILE_K), "r"(0), "r"(0));
+#else
                 asm volatile(
                     "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
                     " [%0], [%1],"
@@ -102,6 +137,7 @@ __global__ void aiu_gemm_kernel(
                        "r"(K_GROUP), "r"(1), "r"(N_GROUP),
                        "r"(kt * TILE_K), "r"(0), "r"(0),
                        "r"(TILE_K), "r"(1), "r"(N_GROUP), "r"(1));
+#endif
                 asm volatile("ppu.cp.async.commit_group;");
                 asm volatile("ppu.cp.async.wait_group 0;");
             }
@@ -113,6 +149,14 @@ __global__ void aiu_gemm_kernel(
                 int ch_off_a = kt * 32;
                 int ch_off_b = nt * 32;
 
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+                unsigned int matrix_addr_a = (smem_a_addr + ch_off_a) >> 4;
+                asm volatile(
+                    "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.shared.b16"
+                    " {%0, %1, %2, %3}, [%4], %5, %6, %7;"
+                    : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                    : "r"(matrix_addr_a), "r"(1), "r"(64), "r"(0));
+#else
                 asm volatile(
                     "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
                     " {%0, %1, %2, %3}, [%4],"
@@ -120,7 +164,16 @@ __global__ void aiu_gemm_kernel(
                     : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
                     : "r"(smem_a_addr),
                       "r"(0), "r"(0), "r"(TILE_M), "r"(1), "r"(1), "r"(ch_off_a));
+#endif
 
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+                unsigned int matrix_addr_b = (smem_b_addr + ch_off_b) >> 4;
+                asm volatile(
+                    "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.trans.shared.b16"
+                    " {%0, %1, %2, %3}, [%4], %5, %6, %7;"
+                    : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                    : "r"(matrix_addr_b), "r"(1), "r"(64), "r"(0));
+#else
                 asm volatile(
                     "ppu.tc01.ldmatrix.swzl.sync.aligned.m16n16.x1.trans.shared.b16"
                     " {%0, %1, %2, %3}, [%4],"
@@ -128,16 +181,17 @@ __global__ void aiu_gemm_kernel(
                     : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
                     : "r"(smem_b_addr),
                       "r"(0), "r"(0), "r"(TILE_K), "r"(1), "r"(1), "r"(ch_off_b));
+#endif
 
                 // FP16 MMA: f32.f16.f16.f32
                 asm volatile(
-                    "ppu.tc01.mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32 "
+                    TIX_TC_PREFIX ".mma.sync.aligned.m16n16k16.row.col.f32.f16.f16.f32 "
                     "{%0,%1,%2,%3,%4,%5,%6,%7}, "
                     "{%8,%9,%10,%11}, "
                     "{%12,%13,%14,%15}, "
                     "{%16,%17,%18,%19,%20,%21,%22,%23};"
-                    : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3]),
-                      "+f"(c[nt][4]), "+f"(c[nt][5]), "+f"(c[nt][6]), "+f"(c[nt][7])
+                    : "=f"(c[nt][0]), "=f"(c[nt][1]), "=f"(c[nt][2]), "=f"(c[nt][3]),
+                      "=f"(c[nt][4]), "=f"(c[nt][5]), "=f"(c[nt][6]), "=f"(c[nt][7])
                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
                       "r"(b0), "r"(b1), "r"(b2), "r"(b3),
                       "f"(c[nt][0]), "f"(c[nt][1]), "f"(c[nt][2]), "f"(c[nt][3]),
@@ -154,6 +208,18 @@ __global__ void aiu_gemm_kernel(
     #pragma unroll
     for (int nt = 0; nt < N_GROUP / TILE_N; ++nt) {
         float *d_base = D + tile_row * TILE_M * N + (ng * N_GROUP + nt * TILE_N);
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+        // tc02 C/D: two adjacent columns, upper/lower fragments of the left half first, then the right half.
+        const int col = c_blk * 2;
+        d_base[r_blk * N + col]           = c[nt][0];
+        d_base[r_blk * N + col + 1]       = c[nt][1];
+        d_base[(8 + r_blk) * N + col]     = c[nt][2];
+        d_base[(8 + r_blk) * N + col + 1] = c[nt][3];
+        d_base[r_blk * N + col + 8]       = c[nt][4];
+        d_base[r_blk * N + col + 9]       = c[nt][5];
+        d_base[(8 + r_blk) * N + col + 8] = c[nt][6];
+        d_base[(8 + r_blk) * N + col + 9] = c[nt][7];
+#else
         d_base[(r_blk) * N + (c_blk + 0)]      = c[nt][0];
         d_base[(r_blk) * N + (c_blk + 4)]      = c[nt][1];
         d_base[(r_blk) * N + (c_blk + 8)]      = c[nt][2];
@@ -162,8 +228,11 @@ __global__ void aiu_gemm_kernel(
         d_base[(8 + r_blk) * N + (c_blk + 4)]  = c[nt][5];
         d_base[(8 + r_blk) * N + (c_blk + 8)]  = c[nt][6];
         d_base[(8 + r_blk) * N + (c_blk + 12)] = c[nt][7];
+#endif
     }
 }
+
+#undef TIX_TC_PREFIX
 
 static void retile_A(const __half *A, __half *A_retiled, int M, int K)
 {

@@ -1,0 +1,85 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <vector>
+
+// Match the rt2/rt3 declarations through the actual function pointer type instead of casting pointer arrays.
+using BatchRt2 = hggcError_t (*)(void **, void **, size_t *, size_t,
+    hggcMemcpyAttributes *, size_t *, size_t, size_t *, hggcStream_t);
+using BatchRt3 = hggcError_t (*)(void *const *, const void *const *, const size_t *, size_t,
+    hggcMemcpyAttributes *, size_t *, size_t, hggcStream_t);
+static hggcError_t submit_batch(BatchRt2 api, void **dsts, void **srcs, size_t *sizes,
+    size_t count, hggcMemcpyAttributes *attrs, size_t *idxs, size_t num_attrs,
+    size_t *fail_idx, hggcStream_t stream) {
+    return api(dsts, srcs, sizes, count, attrs, idxs, num_attrs, fail_idx, stream);
+}
+static hggcError_t submit_batch(BatchRt3 api, void **dsts, void **srcs, size_t *sizes,
+    size_t count, hggcMemcpyAttributes *attrs, size_t *idxs, size_t num_attrs,
+    size_t *, hggcStream_t stream) {
+    std::vector<const void *> const_srcs(srcs, srcs + count);
+    return api(dsts, const_srcs.data(), sizes, count, attrs, idxs, num_attrs, stream);
+}
+
+int main(int argc, char **argv) {
+    const int device = findHggcDevice(argc, const_cast<const char **>(argv));
+    constexpr size_t count = 6;
+    size_t sizes[count] = {13, 257, 1023, 4099, 8191, 16387};
+    void *srcs[count] = {}, *dsts[count] = {};
+    std::vector<unsigned char> inputs[count], outputs[count];
+    hggcStream_t stream;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+    for (size_t i = 0; i < count; ++i) {
+        inputs[i].resize(sizes[i]);
+        outputs[i].resize(sizes[i]);
+        for (size_t j = 0; j < sizes[i]; ++j)
+            inputs[i][j] = static_cast<unsigned char>((j * 37 + i * 53 + 11) % 251);
+        checkHggcErrors(hggcMalloc(&srcs[i], sizes[i]));
+        checkHggcErrors(hggcMalloc(&dsts[i], sizes[i]));
+        checkHggcErrors(hggcMemcpy(srcs[i], inputs[i].data(), sizes[i], hggcMemcpyHostToDevice));
+        checkHggcErrors(hggcMemsetAsync(dsts[i], 0xa5, sizes[i], stream));
+    }
+    // Attribute start indices: attrs[0] covers [0,3) and attrs[1] covers [3,6).
+    // Use non-overlapping allocations on the same selected device with no data dependency inside the batch.
+    hggcMemcpyAttributes attrs[2] = {};
+    for (auto &attr : attrs) {
+        attr.srcAccessOrder = hggcMemcpySrcAccessOrderStream;
+        attr.srcLocHint.type = attr.dstLocHint.type = hggcMemLocationTypeDevice;
+        attr.srcLocHint.id = attr.dstLocHint.id = device;
+        attr.flags = hggcMemcpyFlagDefault;
+    }
+    size_t attrs_idxs[2] = {0, 3};
+    size_t fail_idx = std::numeric_limits<size_t>::max();
+    const hggcError_t status = submit_batch(hggcMemcpyBatchAsync,
+        dsts, srcs, sizes, count, attrs, attrs_idxs, 2, &fail_idx, stream);
+    if (status != hggcSuccess) {
+        std::fprintf(stderr, "batch failed: %s", hggcGetErrorString(status));
+        if (fail_idx != std::numeric_limits<size_t>::max())
+            std::fprintf(stderr, ", failIdx=%zu", fail_idx);
+        std::fprintf(stderr, "\n");
+    }
+    checkHggcErrors(status);
+    checkHggcErrors(hggcStreamSynchronize(stream));
+    bool pass = true;
+    for (size_t i = 0; i < count; ++i) {
+        checkHggcErrors(hggcMemcpy(outputs[i].data(), dsts[i], sizes[i], hggcMemcpyDeviceToHost));
+        for (size_t j = 0; j < sizes[i]; ++j) {
+            if (outputs[i][j] != inputs[i][j]) {
+                std::printf("MISMATCH copy=%zu byte=%zu got=%u expected=%u\n",
+                            i, j, unsigned(outputs[i][j]), unsigned(inputs[i][j]));
+                pass = false;
+                break;
+            }
+        }
+        checkHggcErrors(hggcFree(srcs[i]));
+        checkHggcErrors(hggcFree(dsts[i]));
+    }
+    checkHggcErrors(hggcStreamDestroy(stream));
+    std::printf("memcpy_batch_async device=%d copies=%zu: %s\n", device, count, pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

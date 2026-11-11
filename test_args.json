@@ -1,26 +1,17 @@
 {
-    "aiu_gemm": {
-        "skip_arch": ["ppu0015"]
-    },
-    "aiu_async_copy": {
-        "skip_arch": ["ppu0015"]
-    },
-    "aiu_throughput": {
-        "skip_arch": ["ppu0015"]
-    },
-    "bf16_tensor_cell_gemm": {
-        "skip_arch": ["ppu0015"]
-    },
-    "imma_tensor_cell_gemm": {
-        "skip_arch": ["ppu0015"]
-    },
-    "tf32_tensor_cell_gemm": {
-        "skip_arch": ["ppu0015"]
-    },
-    "transpose": {
-        "skip_arch": ["ppu0015"]
-    },
     "multi_device_collab": {
         "min_ppus": 2
-    }
+    },
+    "aiu_async_copy": {"args": ["-device=0"]},
+    "aiu_gemm": {"args": ["-device=0"]},
+    "bf16_tensor_cell_gemm": {"args": ["-device=0"]},
+    "imma_tensor_cell_gemm": {"args": ["-device=0"]},
+    "tf32_tensor_cell_gemm": {"args": ["-device=0"]},
+    "aiu_throughput": {"args": ["-device=0"]},
+    "transpose": {"args": ["-device=0"]},
+    "memcpy_batch_async": {"args": ["-device=0"]},
+    "array_roundtrip": {"args": ["-device=0"]},
+    "atomic_intrinsics_static": {"args": ["-device=0"]},
+    "atomic_intrinsics_hgrtc": {"args": ["-device=0"]},
+    "graph_memory_nodes": {"args": ["-device=0"]}
 }

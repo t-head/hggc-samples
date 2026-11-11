@@ -15,6 +15,7 @@
 #include <helper_functions.h>
 #include <helper_hggc.h>
 
+#define ATOMIC_DEVICE_CODE
 #include "atomic_kernel.hgh"
 
 /// Run every supported atomic primitive once per active thread.
@@ -24,7 +25,7 @@ __global__ void atomic_op_suite(int *slots)
 
     /// Bitwise group.
     atomicAnd(&slots[kSlotAnd], 2 * tid + 7);
-    atomicOr (&slots[kSlotOr],  1 << tid);
+    atomicOr(reinterpret_cast<unsigned int *>(&slots[kSlotOr]), 1u << (tid % 32));
     atomicXor(&slots[kSlotXor], tid);
 
     /// Arithmetic group.
@@ -93,6 +94,18 @@ int main(int argc, char **argv) {
     std::printf("Processing time: %f (ms)\n", timer.elapsed());
 
     bool ok = computeGold(host_slots, kThreadsPerBlock * kBlocksPerGrid);
+
+    UllResults ull = {};
+    UllResults *dev_ull = nullptr;
+    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&dev_ull), sizeof(ull)));
+    ull_concurrent_suite<<<1, kUllThreads, 0, stream>>>(dev_ull);
+    checkHggcErrors(hggcGetLastError());
+    ull_old_suite<<<1, 1, 0, stream>>>(dev_ull);
+    checkHggcErrors(hggcGetLastError());
+    checkHggcErrors(hggcStreamSynchronize(stream));
+    checkHggcErrors(hggcMemcpy(&ull, dev_ull, sizeof(ull), hggcMemcpyDeviceToHost));
+    ok = computeUllGold(ull) && ok;
+    checkHggcErrors(hggcFree(dev_ull));
 
     checkHggcErrors(hggcStreamDestroy(stream));
     checkHggcErrors(hggcFree(dev_slots));

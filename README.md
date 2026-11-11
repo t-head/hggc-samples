@@ -2,7 +2,15 @@
 
 # HGGC Sample Programs
 
-HGGC-Samples is a collection of sample programs for HGGC developers, demonstrating various features of the T-Head SAIL toolkit. The current version supports SAIL 2.1.
+HGGC-Samples is a collection of sample programs for HGGC developers, demonstrating features of the T-Head SAIL toolkit. The current version supports SAIL 2.2.0.
+
+Compared with SAIL 2.1.0, this version adds `memcpy_batch_async` (batched asynchronous D2D copies) and `array_roundtrip` (1D/2D/3D array round-trip verification).
+
+## SAIL 2.2.0 Sample Coverage
+
+- Seven AIU/TIX samples provide architecture-specific implementations for ppu001 and ppu0015.
+- The existing `atomic_intrinsics` sample covers ULL atomic operations in both static and HGRTC paths; `graph_memory_nodes` covers explicit graph upload as well as ordinary launch.
+- A new sample does not imply that its APIs were first introduced in this version.
 
 # Prerequisites
 
@@ -54,9 +62,9 @@ make -j$(nproc)
 
 Run the samples from their respective subdirectories within the build directory. You may also perform the above steps from any subdirectory of the samples repository, or from an individual sample directory.
 
-### Architecture-Specific Samples
+### Architecture-Specific TIX Paths
 
-A small number of samples use instructions that are only available on ppu001 hardware. These samples are automatically built for ppu001 (`ppu_10`) only, even when the default dual-architecture configuration is used. Their README files indicate this limitation under **Supported PPU Architectures**.
+Samples that use architecture-specific TIX instructions select the matching ppu001 (`tc01`/legacy AIU descriptor) or ppu0015 (`tc02`/2D tile AIU descriptor) implementation at device compile time.
 
 ## Running All Samples with the Test Script
 
@@ -85,9 +93,6 @@ Configuration example:
 {
     "multi_device_collab": {
         "min_ppus": 2
-    },
-    "aiu_gemm": {
-        "skip_arch": ["ppu0015"]
     }
 }
 ```
@@ -151,7 +156,7 @@ Basic HGGC samples for beginners, demonstrating core concepts of using HGGC and 
 
 ### 1. Utilities
 
-Utility samples demonstrating how to query device capabilities and measure Zhenwu PPU/CPU bandwidth.
+Utility samples demonstrating how to query device capabilities and system topology.
 
 ### 2. Algorithms and Techniques
 

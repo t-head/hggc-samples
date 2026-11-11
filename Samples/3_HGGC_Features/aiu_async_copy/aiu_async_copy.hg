@@ -7,7 +7,7 @@
  * Sample code demonstrating T-HEAD SAIL SDK usage. This code is provided
  * under the Apache License 2.0 for reference and educational purposes.
  *
- * aiu_async_copy -- AIU TIX 1.0 Async Copy + ldmatrix.swzl Round-Trip
+ * aiu_async_copy -- Cross-architecture AIU Async Copy + ldmatrix.swzl Round-Trip
  *
  * Demonstrates warp-parallel tile-based GEMM-style data loading:
  * - A large 64×1×64 bf16 tensor resides in global memory.
@@ -16,7 +16,6 @@
  * - Each warp de-swizzles its tile via 4 ldmatrix.swzl calls.
  * - All tiles processed in parallel, verifying data integrity.
  */
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -89,18 +88,32 @@ __global__ void aiu_copy_and_load(const uint16_t * __restrict__ input,
     if (lane == 0) {
         int start_h = warpIdx * TILE_H;
 
-        // Tensor: full big tensor [BIG_H, MAT_W, MAT_C]
-        // Cube:  tile slice    [TILE_H, MAT_W, MAT_C]
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+        // ppu0015 uses the 2D tile descriptor: C is contiguous and W selects rows.
+        unsigned long long tensor_stride_w = MAT_C * sizeof(uint16_t);
+        unsigned long long tensor_stride_n = BIG_H * tensor_stride_w;
+        asm volatile(
+            "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.padz.swzl.b16"
+            " [%0], [%1],"
+            " {%2, %3, %4}, {%5, %6, %7},"
+            " {%8, %9}, {%10, %11, %12}, %13;"
+            :: "r"(my_smem_addr), "l"(input),
+               "r"(MAT_C), "r"(BIG_H), "r"(1),
+               "r"(MAT_C), "r"(TILE_H), "r"(1),
+               "l"(tensor_stride_w), "l"(tensor_stride_n),
+               "r"(0), "r"(start_h), "r"(0), "r"(0));
+#else
+        // ppu001 uses the legacy 3D descriptor.
         asm volatile(
             "ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16"
             " [%0], [%1],"
             " {%2, %3, %4, %5, %6, %7},"
             " {%8, %9, %10, %11};"
             :: "r"(my_smem_addr), "l"(input),
-               "r"(BIG_H),  "r"(MAT_W), "r"(MAT_C),     // dim_h, dim_w, dim_c
-               "r"(start_h), "r"(0),    "r"(0),         // start_h, start_w, start_c
-               "r"(TILE_H), "r"(MAT_W), "r"(MAT_C),     // cube_h, cube_w, cube_c
-               "r"(1));                                   // cube_n
+               "r"(BIG_H), "r"(MAT_W), "r"(MAT_C),
+               "r"(start_h), "r"(0), "r"(0),
+               "r"(TILE_H), "r"(MAT_W), "r"(MAT_C), "r"(1));
+#endif
 
         asm volatile("ppu.cp.async.commit_group;");
         asm volatile("ppu.cp.async.wait_group 0;");
@@ -120,6 +133,18 @@ __global__ void aiu_copy_and_load(const uint16_t * __restrict__ input,
     #pragma unroll
     for (int iter = 0; iter < N_LDMATRIX; ++iter) {
         int ch_off = iter * 32;  // 0, 32, 64, 96
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 150)
+        unsigned int matrix_addr = (my_smem_addr + ch_off) >> 4;
+        asm volatile(
+            "ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.shared.b16"
+            " {%0, %1, %2, %3}, [%4], %5, %6, %7;"
+            : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
+              "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
+            : "r"(matrix_addr), "r"(1), "r"(64), "r"(0));
+        unsigned int tmp = frag[iter*4+1];
+        frag[iter*4+1] = frag[iter*4+2];
+        frag[iter*4+2] = tmp;
+#else
         asm volatile(
             "ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16"
             " {%0, %1, %2, %3}, [%4],"
@@ -127,9 +152,8 @@ __global__ void aiu_copy_and_load(const uint16_t * __restrict__ input,
             : "=r"(frag[iter*4+0]), "=r"(frag[iter*4+1]),
               "=r"(frag[iter*4+2]), "=r"(frag[iter*4+3])
             : "r"(my_smem_addr),
-              "r"(0),       "r"(0),        // start_h, start_w
-              "r"(TILE_H),   "r"(MAT_W),     // cube_h, cube_w
-              "r"(1),        "r"(ch_off));   // cube_n, channel_offset
+              "r"(0), "r"(0), "r"(TILE_H), "r"(MAT_W), "r"(1), "r"(ch_off));
+#endif
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -177,7 +201,7 @@ __global__ void aiu_copy_and_load(const uint16_t * __restrict__ input,
 
 int main(int argc, char **argv)
 {
-    printf("[aiu_async_copy] AIU TIX 1.0 Async Copy + ldmatrix.swzl\n");
+    printf("[aiu_async_copy] AIU Async Copy + ldmatrix.swzl\n");
     printf("  Warp-parallel tile-based GEMM-style data loading demo\n\n");
     findHggcDevice(argc, (const char **)argv);
 
@@ -224,35 +248,19 @@ int main(int argc, char **argv)
                                 N_ELEM * sizeof(uint16_t),
                                 hggcMemcpyDeviceToHost));
 
-    // ── Verify: sorted multiset comparison (uint16_t) ──
-    printf("  Verification: sorted multiset comparison (uint16_t)\n");
-    auto *in_sorted  = new uint16_t[N_ELEM];
-    auto *out_sorted = new uint16_t[N_ELEM];
-    memcpy(in_sorted,  h_input,  N_ELEM * sizeof(uint16_t));
-    memcpy(out_sorted, h_output, N_ELEM * sizeof(uint16_t));
-    std::sort(in_sorted,  in_sorted  + N_ELEM);
-    std::sort(out_sorted, out_sorted + N_ELEM);
-
+    // ── Verify: every value must match at its original position ──
+    printf("  Verification: exact position comparison (uint16_t)\n");
     int mismatch_count = 0;
     for (int i = 0; i < N_ELEM; ++i) {
-        if (in_sorted[i] != out_sorted[i]) {
+        if (h_output[i] != h_input[i]) {
             if (mismatch_count < 8)
                 printf("  mismatch[%d]: expected %d, got %d\n",
-                       i, in_sorted[i], out_sorted[i]);
+                       i, h_input[i], h_output[i]);
             ++mismatch_count;
         }
     }
-    delete[] in_sorted;
-    delete[] out_sorted;
-
-    if (mismatch_count > 0)
-        printf("  %d mismatches out of %d elements\n", mismatch_count, N_ELEM);
-
-    // Check exact position matches
-    int match = 0;
-    for (int i = 0; i < N_ELEM; ++i)
-        if (h_output[i] == h_input[i]) ++match;
-    printf("  Exact position matches: %d/%d\n", match, N_ELEM);
+    printf("  Exact position matches: %d/%d\n",
+           N_ELEM - mismatch_count, N_ELEM);
 
     bool pass = (mismatch_count == 0);
 

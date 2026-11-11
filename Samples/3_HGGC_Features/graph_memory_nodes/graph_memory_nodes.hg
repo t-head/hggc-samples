@@ -12,7 +12,7 @@
  * Builds the exact same computation graph two different ways and
  * verifies they produce identical results:
  *
- *   Method 1: Explicit Graph API (hggcGraphAddKernelNode, AddMemcpyNode, etc.)
+ *   Method 1: Explicit Graph API (MemAlloc -> scale -> bias -> MemFree)
  *   Method 2: Stream Capture (hggcStreamBeginCapture + normal kernel launches)
  *
  * Computation: input -> scale(x2) -> bias(+1) -> output
@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include <hggc_runtime.h>
 #include <helper_hggc.h>
@@ -157,7 +158,7 @@ int main(int argc, char **argv)
 {
     printf("[graph_memory_nodes] Graph Construction: API vs Stream Capture\n\n");
 
-    findHggcDevice(argc, (const char **)argv);
+    const int device = findHggcDevice(argc, (const char **)argv);
 
     size_t bytes = N * sizeof(float);
 
@@ -165,58 +166,49 @@ int main(int argc, char **argv)
     float *h_input = (float *)malloc(bytes);
     for (int i = 0; i < N; ++i) h_input[i] = (float)i;
 
-    // Device buffers
-    float *d_input, *d_data1, *d_data2;
+    float *d_input;
     checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_input), bytes));
-    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data1), bytes));
-    checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_data2), bytes));
     checkHggcErrors(hggcMemcpy(d_input, h_input, bytes, hggcMemcpyHostToDevice));
 
-    // Build graphs both ways
-    printf("  Method 1: Explicit Graph API (MemAlloc/Free nodes)...\n");
-    hggcGraphExec_t exec1 = build_graph_api(d_data1, d_input, N, 0);
-
-    printf("  Method 2: Stream Capture (hggcMallocAsync/FreeAsync)...\n");
-    hggcGraphExec_t exec2 = build_stream_capture(d_data2, d_input, N);
-
-    // Launch both
     hggcStream_t stream;
     checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
-
-    checkHggcErrors(hggcGraphLaunch(exec1, stream));
-    checkHggcErrors(hggcGraphLaunch(exec2, stream));
-    checkHggcErrors(hggcStreamSynchronize(stream));
-
-    // Read back results
-    float *h_out1 = (float *)malloc(bytes);
-    float *h_out2 = (float *)malloc(bytes);
-    checkHggcErrors(hggcMemcpy(h_out1, d_data1, bytes, hggcMemcpyDeviceToHost));
-    checkHggcErrors(hggcMemcpy(h_out2, d_data2, bytes, hggcMemcpyDeviceToHost));
-
-    // Verify: both should produce input*2 + 1
+    const char *labels[] = {"API/launch", "API/upload+launch",
+                            "capture/launch", "capture/upload+launch"};
+    std::vector<float> baseline(N), output(N);
     bool pass = true;
-    for (int i = 0; i < N; ++i) {
-        float expected = (float)i * 2.0f + 1.0f;
-        if (fabsf(h_out1[i] - expected) > 1e-5f ||
-            fabsf(h_out2[i] - expected) > 1e-5f ||
-            fabsf(h_out1[i] - h_out2[i]) > 1e-5f) {
-            printf("  MISMATCH at [%d]: api=%f capture=%f expected=%f\n",
-                   i, h_out1[i], h_out2[i], expected);
-            pass = false;
-            break;
+    for (int path = 0; path < 4; ++path) {
+        // Each path uses a fresh instance and its own output; upload happens before the first launch.
+        float *d_output;
+        checkHggcErrors(hggcMalloc(reinterpret_cast<void **>(&d_output), bytes));
+        checkHggcErrors(hggcMemset(d_output, 0xff, bytes));
+        hggcGraphExec_t exec = path < 2
+            ? build_graph_api(d_output, d_input, N, device)
+            : build_stream_capture(d_output, d_input, N);
+        if (path % 2 != 0) checkHggcErrors(hggcGraphUpload(exec, stream));
+        checkHggcErrors(hggcGraphLaunch(exec, stream));
+        checkHggcErrors(hggcStreamSynchronize(stream));
+        checkHggcErrors(hggcMemcpy(output.data(), d_output, bytes, hggcMemcpyDeviceToHost));
+        if (path == 0) baseline = output;
+        bool path_pass = true;
+        for (int i = 0; i < N; ++i) {
+            const float expected = h_input[i] * 2.0f + 1.0f;
+            if (!std::isfinite(output[i]) || !std::isfinite(baseline[i]) ||
+                fabsf(output[i] - expected) > 1e-5f ||
+                fabsf(output[i] - baseline[i]) > 1e-5f) {
+                printf("%s MISMATCH [%d]: got=%f baseline=%f expected=%f\n",
+                       labels[path], i, output[i], baseline[i], expected);
+                path_pass = false;
+                break;
+            }
         }
+        printf("device=%d %s: %s\n", device, labels[path], path_pass ? "PASS" : "FAIL");
+        pass = path_pass && pass;
+        checkHggcErrors(hggcGraphExecDestroy(exec));
+        checkHggcErrors(hggcFree(d_output));
     }
-
-    printf("\n  Both methods produce identical results: %s\n", pass ? "YES" : "NO");
-
-    // Cleanup
-    checkHggcErrors(hggcGraphExecDestroy(exec1));
-    checkHggcErrors(hggcGraphExecDestroy(exec2));
     checkHggcErrors(hggcStreamDestroy(stream));
     checkHggcErrors(hggcFree(d_input));
-    checkHggcErrors(hggcFree(d_data1));
-    checkHggcErrors(hggcFree(d_data2));
-    free(h_input); free(h_out1); free(h_out2);
+    free(h_input);
 
     printf("\n  Result: %s\n", pass ? "PASS" : "FAIL");
     return pass ? EXIT_SUCCESS : EXIT_FAILURE;

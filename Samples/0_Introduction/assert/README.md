@@ -15,6 +15,10 @@ Two build targets:
 - **Runtime API version** (`assert.hg`): kernel and host code statically compiled.
 - **HGRTC runtime compilation version** (`assert_runtime_compile.cpp` + `assert_kernel.hg`): libHGRTC just-in-time compilation + Driver API load and execution.
 
+The static `assert` target retains Release optimization and adds `-UNDEBUG` only to its HG compilation. A compile-time `NDEBUG` guard prevents building the sample with disabled device assertions.
+
+Both variants require the normal scenario to complete without an assertion error and the corrupted-output scenario to report `hggcErrorAssert` or `HGGC_ERROR_ASSERT`, respectively. After the expected assertion, the sample exits without reusing the failed context or resetting the shared device.
+
 ## Key Concepts
 
 Device Assert, Invariant Checking, Runtime Compilation, Error Propagation.
@@ -34,7 +38,7 @@ ppu001, ppu0015
 ## HGGC APIs Involved
 
 ### HGGC Runtime API
-hggcMalloc, hggcMemcpy, hggcFree, hggcDeviceSynchronize, hggcGetErrorString, hggcGetLastError, hggcDeviceReset
+hggcMalloc, hggcMemcpy, hggcFree, hggcDeviceSynchronize, hggcGetErrorString, hggcGetLastError
 
 ### HGGC Driver API
 hgMemAlloc, hgMemFree, hgMemcpyHtoD, hgModuleGetFunction, hgLaunchKernel, hgCtxSynchronize

@@ -3,6 +3,8 @@
 # ---------------------------------------------------------------------------
 add_executable(assert assert.hg)
 target_include_directories(assert PRIVATE ${COMMON_DIR})
+# Keep the Release optimization level; only disable NDEBUG for the assert sample.
+target_compile_options(assert PRIVATE $<$<COMPILE_LANGUAGE:HG>:-UNDEBUG>)
 
 # ---------------------------------------------------------------------------
 # Target 2: assert_runtime_compile  (HGRTC JIT)

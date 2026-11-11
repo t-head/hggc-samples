@@ -5,7 +5,7 @@ This directory contains introductory HGGC samples, organized by topic into the s
 ## Kernel Basics
 
 ### vector_add
-Element-wise vector addition, providing 4 build modes (within the same directory):
+Weighted vector linear combination (`out[i] = alpha * x[i] + beta * y[i] + gamma`), providing 4 build modes (within the same directory):
 - `vector_add` — Runtime API + single .hg
 - `vector_add_runtime_compile` — HGRTC runtime compilation
 - `vector_add_driver_api` — Driver API + offline fatbin
@@ -38,7 +38,7 @@ Device-side `clock()` microbenchmark: compares cycle overhead of coalesced vs. s
 Covers three scenarios: stream concurrency, HyperQ multi-stream parallelism, and overlapping multiple asynchronous copies.
 
 ### stream_callback
-CPU callbacks under heterogeneous workloads: binds host callbacks after queuing events on streams, demonstrating PPU/CPU collaboration.
+Uses independent streams and C++11 worker threads to launch kernels, then verifies results in host callbacks and signals completion through an atomic counter.
 
 ## Multi-Device and System Integration
 
@@ -64,7 +64,7 @@ Demonstrates arrive-wait barrier and cooperative groups for intra-thread-block s
 ## Atomics and Vote
 
 ### atomic_intrinsics
-Covers global/shared memory atomic instructions, including both static compilation and HGRTC runtime compilation variants.
+Covers 32-bit and ULL atomic operations in global/shared memory through both static and HGRTC variants, checking concurrent final values and sequential old values.
 
 ### warp_vote_ops
 Warp-level vote intrinsics (`__any_sync`, `__all_sync`) demonstration.
@@ -89,16 +89,12 @@ Dot product of two FP16 vectors, demonstrating half-precision arithmetic and red
 
 ## Sorting
 
-### merge_sort_bitonic
-Bitonic merge sort (Batcher sort): a sorting-network-based parallel sorting algorithm suitable for batch sorting of small-to-medium key-value arrays. Provides Runtime API single .hg build.
+### block_sort_merge
+Two-stage parallel sort: per-block odd-even transposition sorting followed by bitonic merging of adjacent sorted blocks. Verifies key-value stability against `std::stable_sort` on the CPU.
 
 ## C++ and Project Templates
 
 ### cpp_template_kernels
-Policy-based Parallel Reduction: template template parameters inject reduction policies (SumOp/MaxOp), DynamicSharedBuffer<T> dynamic shared memory wrapper, multi-type x multi-operation combination dispatch.
-
-### project_template
-GEMV (y = A·x) demo project: shared memory tiling, multi-block grid computation, mixed .hg/.cpp compilation with CPU reference verification, suitable as a starting point for new projects.
 Policy-based Parallel Reduction: template template parameters inject reduction policies (SumOp/MaxOp), DynamicSharedBuffer<T> dynamic shared memory wrapper, multi-type x multi-operation combination dispatch.
 
 ### project_template
