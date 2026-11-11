@@ -1,0 +1,85 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include <hggc_runtime.h>
+#include <acdnn.h>
+#include <helper_hggc.h>
+#include <cstdio>
+#include <cstdlib>
+#include "softmax_reference.h"
+
+#define checkAcdnnErrors(call) do { \
+    const acdnnStatus_t status = (call); \
+    if (status != ACDNN_STATUS_SUCCESS) { \
+        std::fprintf(stderr, "ACDNN error %s:%d code=%d: %s\n", \
+                     __FILE__, __LINE__, int(status), #call); \
+        std::exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
+static bool run_case(acdnnHandle_t handle, hggcStream_t stream, int device, int channels) {
+    using namespace softmax_bf16;
+    const Shape shape{2, channels, 3, 5};
+    const auto input = make_input(shape);
+    const auto expected = reference(shape, input);
+    std::vector<Bf16> output(shape.count());
+    const std::size_t bytes = input.size() * sizeof(Bf16);
+    void *d_input = nullptr, *d_output = nullptr;
+    void *h_input = nullptr, *h_output = nullptr;
+    acdnnTensorDescriptor_t x_desc = nullptr, y_desc = nullptr;
+    checkAcdnnErrors(acdnnCreateTensorDescriptor(&x_desc));
+    checkAcdnnErrors(acdnnCreateTensorDescriptor(&y_desc));
+    checkAcdnnErrors(acdnnSetTensor4dDescriptor(x_desc, ACDNN_TENSOR_NCHW, ACDNN_DATA_BF16,
+                                              shape.n, shape.c, shape.h, shape.w));
+    checkAcdnnErrors(acdnnSetTensor4dDescriptor(y_desc, ACDNN_TENSOR_NCHW, ACDNN_DATA_BF16,
+                                              shape.n, shape.c, shape.h, shape.w));
+    checkHggcErrors(hggcMalloc(&d_input, bytes));
+    checkHggcErrors(hggcMalloc(&d_output, bytes));
+    checkHggcErrors(hggcMallocHost(&h_input, bytes));
+    checkHggcErrors(hggcMallocHost(&h_output, bytes));
+    std::memcpy(h_input, input.data(), bytes);
+    // Pinned buffers on a single stream keep initialization, softmax and the copy back ordered.
+    checkHggcErrors(hggcMemcpyAsync(d_input, h_input, bytes, hggcMemcpyHostToDevice, stream));
+    // BF16 NaN sentinel: with beta=0 the old output must not be read, and unwritten areas must be rejected.
+    checkHggcErrors(hggcMemsetAsync(d_output, 0xff, bytes, stream));
+    const float alpha = 1.0f, beta = 0.0f;
+    checkAcdnnErrors(acdnnSoftmaxForward(handle, ACDNN_SOFTMAX_ACCURATE,
+                                       ACDNN_SOFTMAX_MODE_CHANNEL, &alpha,
+                                       x_desc, d_input, &beta, y_desc, d_output));
+    checkHggcErrors(hggcMemcpyAsync(h_output, d_output, bytes, hggcMemcpyDeviceToHost, stream));
+    checkHggcErrors(hggcStreamSynchronize(stream));
+    std::memcpy(output.data(), h_output, bytes);
+    const auto metrics = validate(shape, output, expected);
+    std::printf("device=%d NCHW=2x%dx3x5 max_abs_error=%.9g max_sum_error=%.9g "
+                "invalid=%zu mismatches=%zu: %s\n", device, channels,
+                metrics.max_abs_error, metrics.max_sum_error, metrics.invalid,
+                metrics.mismatches, metrics.pass() ? "PASS" : "FAIL");
+    checkHggcErrors(hggcFreeHost(h_output));
+    checkHggcErrors(hggcFreeHost(h_input));
+    checkHggcErrors(hggcFree(d_output));
+    checkHggcErrors(hggcFree(d_input));
+    checkAcdnnErrors(acdnnDestroyTensorDescriptor(y_desc));
+    checkAcdnnErrors(acdnnDestroyTensorDescriptor(x_desc));
+    return metrics.pass();
+}
+
+int main(int argc, char **argv) {
+    const int device = findHggcDevice(argc, (const char **)argv);
+    acdnnHandle_t handle = nullptr;
+    hggcStream_t stream = nullptr;
+    checkHggcErrors(hggcStreamCreateWithFlags(&stream, hggcStreamNonBlocking));
+    checkAcdnnErrors(acdnnCreate(&handle));
+    checkAcdnnErrors(acdnnSetStream(handle, stream));
+    bool pass = true;
+    for (const int channels : {1, 17, 257}) {
+        if (!run_case(handle, stream, device, channels)) {
+            pass = false;
+            break; // Stop after a failure; do not retry or grow the workload.
+        }
+    }
+    checkAcdnnErrors(acdnnDestroy(handle));
+    checkHggcErrors(hggcStreamDestroy(stream));
+    std::printf("acdnn_softmax_bf16: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

@@ -13,5 +13,6 @@
     "array_roundtrip": {"args": ["-device=0"]},
     "atomic_intrinsics_static": {"args": ["-device=0"]},
     "atomic_intrinsics_hgrtc": {"args": ["-device=0"]},
-    "graph_memory_nodes": {"args": ["-device=0"]}
+    "graph_memory_nodes": {"args": ["-device=0"]},
+    "acdnn_softmax_bf16": {"args": ["-device=0"]}
 }

@@ -10,7 +10,7 @@ Cross-architecture AIU asynchronous tensor copy: uses the ppu001 3D or ppu0015 2
 AIU .swzl mode FP16 GEMM: uses architecture-specific AIU 128B swizzle transfer for A/B matrix tiles (16x64), `ldmatrix.swzl` decoding, `.trans` B loading, and `ppu.tc01/tc02.mma.m16n16k16.row.col` accumulation.
 
 ### memcpy_batch_async
-Submits six independent D2D copies on a non-default stream of the selected device, groups them with two attribute-start indices, initializes destination sentinels with hggcMemsetAsync on the same stream, and verifies every byte after synchronization. Function-pointer overloads match the SAIL 2.2.0 rt2/rt3 signatures.
+Submits six independent D2D copies on a non-default stream of the selected device, groups them with two attribute-start indices, initializes destination sentinels with hggcMemsetAsync on the same stream, and verifies every byte after synchronization. Function-pointer overloads match the SAIL 2.2.1 rt2/rt3 signatures.
 
 ### array_roundtrip
 Uses single-plane int32 arrays to verify 1D/2D/3D allocation, queries, full round trips, offset updates, and untouched regions. Distinguishes element extents from byte pitches/offsets and checks host padding.
