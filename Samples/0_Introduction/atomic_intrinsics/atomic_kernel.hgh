@@ -32,3 +32,74 @@ enum AtomicSlot : int {
 
 /// Bitwise pre-seed value placed into AND/XOR slots before kernel launch.
 #define ATOMIC_BITWISE_SEED 0xff
+
+// The concurrent ULL final-value check and the single-thread old-value check use separate storage.
+enum UllSlot { kUllAdd, kUllAnd, kUllOr, kUllXor, kUllMin, kUllMax,
+               kUllExch, kUllCas, kUllSlotCount };
+constexpr unsigned int kUllThreads = 256;
+constexpr unsigned long long kUllBase = 0x1234567800000000ULL;
+constexpr unsigned long long kUllSeed = 0xabcdef1200000011ULL;
+constexpr unsigned long long kUllIncrement = 0x100000003ULL;
+constexpr unsigned long long kUllMask = 0xffff00ffffffffffULL;
+constexpr unsigned long long kUllOrBits = 0x0000008000000000ULL;
+constexpr unsigned long long kUllXorBits = 0x0000400000000007ULL;
+constexpr int kUllOldCount = 9;
+struct UllResults {
+    unsigned long long concurrent[2][kUllSlotCount];
+    unsigned long long old[2][kUllOldCount];
+    unsigned long long final[2];
+};
+bool computeUllGold(const UllResults &results);
+
+#ifdef ATOMIC_DEVICE_CODE
+__device__ void ull_concurrent_ops(unsigned long long *slots, unsigned int tid) {
+    atomicAdd(&slots[kUllAdd], kUllIncrement);
+    atomicAnd(&slots[kUllAnd], ~(1ULL << (tid % 64)));
+    atomicOr(&slots[kUllOr], 1ULL << (tid % 64));
+    atomicXor(&slots[kUllXor], kUllBase | tid);
+    atomicMin(&slots[kUllMin], kUllBase + tid);
+    atomicMax(&slots[kUllMax], kUllBase + tid);
+    atomicExch(&slots[kUllExch], kUllBase + tid);
+    atomicCAS(&slots[kUllCas], kUllSeed, kUllBase);
+}
+
+extern "C" __global__ void ull_concurrent_suite(UllResults *out) {
+    __shared__ unsigned long long shared[kUllSlotCount];
+    const unsigned int tid = threadIdx.x;
+    if (tid == 0) {
+        for (int i = 0; i < kUllSlotCount; ++i) {
+            unsigned long long seed = 0;
+            if (i == kUllAdd) seed = kUllBase;
+            if (i == kUllAnd || i == kUllMin) seed = ~0ULL;
+            if (i == kUllXor || i == kUllCas) seed = kUllSeed;
+            out->concurrent[0][i] = shared[i] = seed;
+        }
+    }
+    __syncthreads();
+    ull_concurrent_ops(out->concurrent[0], tid);
+    ull_concurrent_ops(shared, tid);
+    __syncthreads();
+    if (tid == 0)
+        for (int i = 0; i < kUllSlotCount; ++i) out->concurrent[1][i] = shared[i];
+}
+
+__device__ void ull_old_ops(unsigned long long *value, unsigned long long *old) {
+    old[0] = atomicAdd(value, kUllIncrement);
+    old[1] = atomicAnd(value, kUllMask);
+    old[2] = atomicOr(value, kUllOrBits);
+    old[3] = atomicXor(value, kUllXorBits);
+    old[4] = atomicMin(value, kUllBase);
+    old[5] = atomicMax(value, kUllSeed);
+    old[6] = atomicExch(value, kUllBase);
+    old[7] = atomicCAS(value, kUllBase, kUllSeed);
+    old[8] = atomicCAS(value, kUllBase, 0ULL); // CAS must fail here, so no write is expected.
+}
+
+extern "C" __global__ void ull_old_suite(UllResults *out) {
+    __shared__ unsigned long long shared;
+    out->final[0] = shared = kUllSeed;
+    ull_old_ops(&out->final[0], out->old[0]);
+    ull_old_ops(&shared, out->old[1]);
+    out->final[1] = shared;
+}
+#endif

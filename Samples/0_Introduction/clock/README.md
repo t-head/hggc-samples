@@ -2,7 +2,9 @@
 
 ## Description
 
-This sample uses the device-side `clock()` intrinsic to measure cycle overhead of different memory access patterns, comparing **coalesced** vs. **strided** access to visually demonstrate the impact of memory coalescing on throughput.
+This sample uses the device-side `clock()` intrinsic to measure per-block cycle counts for two illustrative memory access patterns, **coalesced** and **strided**. The coalesced loop repeatedly reads each thread's element; the strided loop wraps within a block-sized region and includes repeated addresses. These patterns are not an independent bandwidth benchmark, and their relative speed is not a correctness invariant.
+
+After each kernel, the host checks every accumulated output against an independent high-precision CPU reference using `abs_error <= 1e-4 + 1e-5 * abs(reference)` and rejects non-finite or unwritten outputs. All block timers must report a valid nonzero elapsed interval. The cycle ratio is printed as `INFO`; `Result: PASS/FAIL` and the exit code depend on data, timing validity, and API success, not which pattern is faster.
 
 Two build targets share the same algorithmic logic, demonstrating different compilation/loading paths:
 

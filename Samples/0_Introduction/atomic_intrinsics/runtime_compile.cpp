@@ -83,7 +83,24 @@ int main(int argc, char **argv) {
 
     bool ok = computeGold(host_slots.data(), kThreadsPerBlock * kBlocksPerGrid);
 
+    UllResults ull = {};
+    HGdeviceptr dev_ull;
+    HGfunction concurrent_kernel, old_kernel;
+    checkHggcErrors(hgMemAlloc(&dev_ull, sizeof(ull)));
+    checkHggcErrors(hgModuleGetFunction(&concurrent_kernel, module, "ull_concurrent_suite"));
+    checkHggcErrors(hgModuleGetFunction(&old_kernel, module, "ull_old_suite"));
+    void *ull_args[] = {&dev_ull};
+    checkHggcErrors(hgLaunchKernel(concurrent_kernel, 1, 1, 1, kUllThreads, 1, 1,
+                                  0, 0, ull_args, nullptr));
+    checkHggcErrors(hgLaunchKernel(old_kernel, 1, 1, 1, 1, 1, 1,
+                                  0, 0, ull_args, nullptr));
+    checkHggcErrors(hgCtxSynchronize());
+    checkHggcErrors(hgMemcpyDtoH(&ull, dev_ull, sizeof(ull)));
+    ok = computeUllGold(ull) && ok;
+    checkHggcErrors(hgMemFree(dev_ull));
     checkHggcErrors(hgMemFree(dev_slots));
+    checkHggcErrors(hgModuleUnload(module));
+    std::free(kernel_path);
 
     std::printf("%s completed, returned %s\n", kSampleLabel, ok ? "OK" : "ERROR!");
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -1,0 +1,170 @@
+/*
+ * Copyright (c) 2023-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include <hggc_runtime.h>
+#include <helper_hggc.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+using Value = std::int32_t;
+
+static bool query_array(hggcArray_t array, size_t w, size_t h, size_t d) {
+    hggcChannelFormatDesc desc = {}, channel = {};
+    hggcExtent extent = {};
+    unsigned int flags = ~0u;
+    checkHggcErrors(hggcArrayGetInfo(&desc, &extent, &flags, array));
+    checkHggcErrors(hggcGetChannelDesc(&channel, array));
+    const bool pass = extent.width == w && extent.height == h && extent.depth == d &&
+        flags == hggcArrayDefault && desc.x == 32 && desc.y == 0 && desc.z == 0 &&
+        desc.w == 0 && desc.f == hggcChannelFormatKindSigned &&
+        channel.x == desc.x && channel.y == desc.y && channel.z == desc.z &&
+        channel.w == desc.w && channel.f == desc.f;
+    std::printf("array query %zux%zux%zu flags=%u: %s\n",
+                extent.width, extent.height, extent.depth, flags, pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static bool compare(const std::vector<Value> &got, const std::vector<Value> &expected,
+                    const char *label) {
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != expected[i]) {
+            std::printf("%s MISMATCH index=%zu got=%d expected=%d\n",
+                        label, i, int(got[i]), int(expected[i]));
+            return false;
+        }
+    }
+    std::printf("%s values=%zu: PASS\n", label, got.size());
+    return true;
+}
+
+static bool roundtrip_1d(const hggcChannelFormatDesc &desc) {
+    constexpr size_t width = 37, offset = 3, patch_width = 29;
+    std::vector<Value> input(width), output(width), expected(width), patch(patch_width);
+    for (size_t i = 0; i < width; ++i) input[i] = Value(i * 31 + 17);
+    for (size_t i = 0; i < patch_width; ++i) patch[i] = -Value(i * 19 + 7);
+    expected = input;
+    hggcArray_t array;
+    checkHggcErrors(hggcMallocArray(&array, &desc, width, 0, hggcArrayDefault));
+    bool pass = query_array(array, width, 0, 0);
+    checkHggcErrors(hggcMemcpyToArray(array, 0, 0, input.data(), width * sizeof(Value), hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpyFromArray(output.data(), array, 0, 0, width * sizeof(Value), hggcMemcpyDeviceToHost));
+    pass = compare(output, expected, "1D full") && pass;
+    // ToArray/FromArray take the X offset and count in bytes.
+    checkHggcErrors(hggcMemcpyToArray(array, offset * sizeof(Value), 0, patch.data(),
+                                    patch_width * sizeof(Value), hggcMemcpyHostToDevice));
+    for (size_t i = 0; i < patch_width; ++i) expected[offset + i] = patch[i];
+    std::vector<Value> sub(patch_width);
+    checkHggcErrors(hggcMemcpyFromArray(sub.data(), array, offset * sizeof(Value), 0,
+                                      patch_width * sizeof(Value), hggcMemcpyDeviceToHost));
+    pass = compare(sub, patch, "1D offset") && pass;
+    checkHggcErrors(hggcMemcpyFromArray(output.data(), array, 0, 0, width * sizeof(Value), hggcMemcpyDeviceToHost));
+    pass = compare(output, expected, "1D surrounding") && pass;
+    checkHggcErrors(hggcFreeArray(array));
+    return pass;
+}
+
+static bool roundtrip_2d(const hggcChannelFormatDesc &desc) {
+    constexpr size_t width = 37, height = 11, pitch_elements = 41;
+    constexpr size_t ox = 3, oy = 2, pw = 29, ph = 7;
+    constexpr Value sentinel = -12345;
+    std::vector<Value> input(pitch_elements * height, sentinel), output(input.size(), sentinel);
+    for (size_t y = 0; y < height; ++y)
+        for (size_t x = 0; x < width; ++x) input[y * pitch_elements + x] = Value(y * 101 + x * 7);
+    auto expected = input;
+    std::vector<Value> patch(pw * ph);
+    for (size_t i = 0; i < patch.size(); ++i) patch[i] = -Value(i * 13 + 3);
+    hggcArray_t array;
+    checkHggcErrors(hggcMallocArray(&array, &desc, width, height, hggcArrayDefault));
+    bool pass = query_array(array, width, height, 0);
+    // For 2D, pitch, X offset and width are in bytes; Y offset and height are in rows.
+    checkHggcErrors(hggcMemcpy2DToArray(array, 0, 0, input.data(), pitch_elements * sizeof(Value),
+                                      width * sizeof(Value), height, hggcMemcpyHostToDevice));
+    checkHggcErrors(hggcMemcpy2DFromArray(output.data(), pitch_elements * sizeof(Value), array, 0, 0,
+                                        width * sizeof(Value), height, hggcMemcpyDeviceToHost));
+    pass = compare(output, expected, "2D full and pitch padding") && pass;
+    checkHggcErrors(hggcMemcpy2DToArray(array, ox * sizeof(Value), oy, patch.data(), pw * sizeof(Value),
+                                      pw * sizeof(Value), ph, hggcMemcpyHostToDevice));
+    for (size_t y = 0; y < ph; ++y)
+        for (size_t x = 0; x < pw; ++x) expected[(oy + y) * pitch_elements + ox + x] = patch[y * pw + x];
+    std::vector<Value> sub(patch.size());
+    checkHggcErrors(hggcMemcpy2DFromArray(sub.data(), pw * sizeof(Value), array, ox * sizeof(Value), oy,
+                                        pw * sizeof(Value), ph, hggcMemcpyDeviceToHost));
+    pass = compare(sub, patch, "2D offset") && pass;
+    checkHggcErrors(hggcMemcpy2DFromArray(output.data(), pitch_elements * sizeof(Value), array, 0, 0,
+                                        width * sizeof(Value), height, hggcMemcpyDeviceToHost));
+    pass = compare(output, expected, "2D surrounding") && pass;
+    checkHggcErrors(hggcFreeArray(array));
+    return pass;
+}
+
+static bool roundtrip_3d(const hggcChannelFormatDesc &desc) {
+    constexpr size_t width = 19, height = 9, depth = 5;
+    constexpr size_t row_elements = 23, slice_rows = 11;
+    constexpr size_t ox = 1, oy = 2, oz = 1, pw = 13, ph = 5, pd = 3;
+    constexpr Value sentinel = -12345;
+    const size_t slice = row_elements * slice_rows;
+    std::vector<Value> input(slice * depth, sentinel), output(input.size(), sentinel);
+    for (size_t z = 0; z < depth; ++z)
+        for (size_t y = 0; y < height; ++y)
+            for (size_t x = 0; x < width; ++x) input[z * slice + y * row_elements + x] = Value(z * 1009 + y * 31 + x);
+    auto expected = input;
+    hggcArray_t array;
+    checkHggcErrors(hggcMalloc3DArray(&array, &desc, hggcExtent{width, height, depth}, hggcArrayDefault));
+    bool pass = query_array(array, width, height, depth);
+    hggcMemcpy3DParms to = {};
+    to.srcPtr = hggcPitchedPtr{input.data(), row_elements * sizeof(Value), row_elements * sizeof(Value), slice_rows};
+    to.dstArray = array;
+    // For 3D copies involving arrays, extent.width counts elements while pos.x is always in bytes (a multiple of the element size); Y/Z are rows/slices.
+    to.extent = hggcExtent{width, height, depth};
+    to.kind = hggcMemcpyHostToDevice;
+    checkHggcErrors(hggcMemcpy3D(&to));
+    hggcMemcpy3DParms from = {};
+    from.srcArray = array;
+    from.dstPtr = hggcPitchedPtr{output.data(), row_elements * sizeof(Value), row_elements * sizeof(Value), slice_rows};
+    from.extent = to.extent;
+    from.kind = hggcMemcpyDeviceToHost;
+    checkHggcErrors(hggcMemcpy3D(&from));
+    pass = compare(output, expected, "3D full and pitch padding") && pass;
+    std::vector<Value> patch(slice * depth, sentinel);
+    for (size_t i = 0; i < patch.size(); ++i) patch[i] = -Value(i * 11 + 1);
+    to.srcPtr.ptr = patch.data();
+    to.srcPos = hggcPos{2 * sizeof(Value), 1, 1};
+    to.dstPos = hggcPos{ox * sizeof(Value), oy, oz}; // pos.x is in bytes, not elements.
+    to.extent = hggcExtent{pw, ph, pd};
+    checkHggcErrors(hggcMemcpy3D(&to));
+    for (size_t z = 0; z < pd; ++z)
+        for (size_t y = 0; y < ph; ++y)
+            for (size_t x = 0; x < pw; ++x)
+                expected[(oz + z) * slice + (oy + y) * row_elements + ox + x] =
+                    patch[(1 + z) * slice + (1 + y) * row_elements + 2 + x];
+    std::vector<Value> sub(pw * ph * pd), sub_expected(sub.size());
+    from.srcPos = hggcPos{ox * sizeof(Value), oy, oz};
+    from.dstPtr = hggcPitchedPtr{sub.data(), pw * sizeof(Value), pw * sizeof(Value), ph};
+    from.extent = to.extent;
+    checkHggcErrors(hggcMemcpy3D(&from));
+    for (size_t z = 0; z < pd; ++z)
+        for (size_t y = 0; y < ph; ++y)
+            for (size_t x = 0; x < pw; ++x)
+                sub_expected[(z * ph + y) * pw + x] = expected[(oz + z) * slice + (oy + y) * row_elements + ox + x];
+    pass = compare(sub, sub_expected, "3D offset") && pass;
+    from.srcPos = hggcPos{0, 0, 0};
+    from.dstPtr = hggcPitchedPtr{output.data(), row_elements * sizeof(Value), row_elements * sizeof(Value), slice_rows};
+    from.extent = hggcExtent{width, height, depth};
+    checkHggcErrors(hggcMemcpy3D(&from));
+    pass = compare(output, expected, "3D surrounding") && pass;
+    checkHggcErrors(hggcFreeArray(array));
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    const int device = findHggcDevice(argc, const_cast<const char **>(argv));
+    const hggcChannelFormatDesc desc = hggcCreateChannelDesc<Value>();
+    bool pass = roundtrip_1d(desc);
+    pass = roundtrip_2d(desc) && pass;
+    pass = roundtrip_3d(desc) && pass;
+    std::printf("array_roundtrip device=%d: %s\n", device, pass ? "PASS" : "FAIL");
+    return pass ? EXIT_SUCCESS : EXIT_FAILURE;
+}

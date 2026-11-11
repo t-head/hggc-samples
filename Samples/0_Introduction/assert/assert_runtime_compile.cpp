@@ -84,6 +84,8 @@ int main(int argc, char **argv)
         printf("    -> No assertion fired (PASS)\n\n");
     } else {
         printf("    -> Unexpected error code: %d\n\n", static_cast<int>(status1));
+        free(h_input);
+        return EXIT_FAILURE;
     }
 
     // ---- Scenario 2: corrupt output, expect assert ----
@@ -97,6 +99,7 @@ int main(int argc, char **argv)
 
     printf("    Launching validation kernel...\n");
     printf("\n-- Begin assert output\n\n");
+    fflush(stdout);
     checkHggcErrors(hgLaunchKernel(fn_validate,
                                    kGridSize, 1, 1,
                                    kBlockSize, 1, 1,
@@ -114,12 +117,9 @@ int main(int argc, char **argv)
                static_cast<int>(status2));
     }
 
-    // Cleanup. If the device assert fired the context is tainted;
-    // reset the device instead of calling individual hgMemFree operations.
+    // The context is unusable after an assertion; cleanup is left to process exit, so the shared device is not reset.
     free(h_input);
-    if (pass) {
-        hggcDeviceReset();
-    } else {
+    if (status2 == HGGC_SUCCESS) {
         checkHggcErrors(hgMemFree(d_input));
         checkHggcErrors(hgMemFree(d_output));
     }

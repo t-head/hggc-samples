@@ -1,15 +1,17 @@
-# aiu_async_copy - AIU TIX 1.0 Async Tensor Copy + ldmatrix.swzl Address Decoding
+# aiu_async_copy - Cross-Architecture AIU Async Tensor Copy + ldmatrix.swzl Address Decoding
 
 ## Description
 
-This sample demonstrates **ppu.cp.async.aiu** (TIX 1.0) asynchronous tensor bulk copy from global memory to shared memory, along with the companion **ppu.tc01.ldmatrix.swzl** for decoding swizzle addresses and loading into registers — a complete pipeline:
+This sample demonstrates architecture-specific **ppu.cp.async.aiu** asynchronous tensor bulk copy from global memory to shared memory, together with **ppu.tc01/tc02.ldmatrix.swzl** address decoding and register loading — a complete pipeline:
 
-1. **AIU copy** — Thread 0 uses `ppu.cp.async.aiu.bulk.tensor.shared.global.cg.3d.padz.swzl.b16` to asynchronously copy a 16x16 bf16 matrix from global memory to 128B-aligned shared memory, with AIU hardware automatically performing swizzle transformation on shared memory addresses to reduce bank conflicts.
-2. **Synchronization** — `commit_group` + `wait_group 0` + `__syncthreads` ensures copy completion and visibility to all threads.
-3. **ldmatrix.swzl load** — A warp of 32 threads collectively executes `ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16`, decoding data from the swizzle-layout shared memory, with each thread obtaining 4 b32 registers (8 bf16 values total).
-4. **Content verification** — Each thread writes its register fragment back to global memory; the host sorts both input/output and performs element-wise comparison to verify data transfer correctness.
+1. **AIU copy** — Lane 0 of each of four warps uses a ppu001 3D descriptor or a ppu0015 2D tile descriptor to asynchronously copy its 16x1x64 tile into a separate, 128B-aligned shared-memory region. AIU performs the swizzle.
+2. **Synchronization** — `commit_group` + `wait_group 0` + `__syncthreads` ensure that the copy is complete and visible to the whole block.
+3. **ldmatrix.swzl load** — Each warp collectively executes four architecture-specific `ppu.tc01/tc02.ldmatrix.swzl` loads. Each load reads 16x16 b16 elements and produces four b32 registers per thread, for a total of 32 b16 elements per thread.
+4. **Content verification** — Write each fragment back to its original positions. The host compares all 4096 elements position by position as `uint16_t` values and requires exact equality. Do not sort the output, as sorting could hide layout errors.
 
-Payload: a single 16x16 bf16 matrix (256 elements), sequential incrementing pattern, pure data movement (no arithmetic), focused on the AIU + ldmatrix.swzl cooperative mechanism.
+The source tensor is 64x1x64: 4096 b16 elements (8192B) initialized as increasing `uint16_t` bit patterns, with no floating-point arithmetic. One block has 128 threads (four warps); each warp handles 16x1x64 elements (2048B).
+
+On ppu0015, swizzle-load addresses use 16B units: `(smem_addr + channel_byte_offset) >> 4`. The tc02 x4 fragment order is top-left, bottom-left, top-right, bottom-right. Swapping R1/R2 allows the common tc01 writeback order: top-left, top-right, bottom-left, bottom-right.
 
 ## Key Concepts
 
@@ -25,9 +27,9 @@ x86_64
 
 ## Supported PPU Architectures
 
-ppu001 only
+ppu001, ppu0015
 
-This sample uses AIU (`ppu.cp.async.aiu.*`) and Tensor Cell (`ppu.tc01.*`) instructions that are not supported on ppu0015.
+The kernel selects the legacy 3D AIU/`tc01` path on ppu001 and the 2D tile AIU/`tc02` path on ppu0015.
 
 ## HGGC APIs and Instructions Involved
 
@@ -35,7 +37,7 @@ This sample uses AIU (`ppu.cp.async.aiu.*`) and Tensor Cell (`ppu.tc01.*`) instr
 hggcMalloc, hggcMemcpy, hggcFree, hggcDeviceSynchronize
 
 ### TIX Instructions
-ppu.cp.async.aiu.bulk.tensor.shared.global, ppu.cp.async.commit_group, ppu.cp.async.wait_group, ppu.tc01.ldmatrix.swzl.sync.aligned.m8n8.x4.shared.b16, ppu.cvta.to.shared.u32
+ppu.cp.async.aiu.bulk.tensor.shared.global, ppu.cp.async.commit_group, ppu.cp.async.wait_group, ppu.tc01/tc02.ldmatrix.swzl, ppu.cvta.to.shared.u32
 
 ## Prerequisites
 Please download and install the T-Head SAIL toolkit for your platform.

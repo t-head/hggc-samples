@@ -17,6 +17,9 @@
  *   1. Correct output  → assert does not fire  → PASS
  *   2. Corrupted output → assert fires          → host detects hggcErrorAssert
  */
+#ifdef NDEBUG
+#error "assert sample requires device assertions; compile with -UNDEBUG"
+#endif
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +122,8 @@ int main(int argc, char **argv)
         printf("    -> No assertion fired (PASS)\n\n");
     } else {
         printf("    -> Unexpected error: %s\n\n", hggcGetErrorString(status1));
+        free(h_input);
+        return EXIT_FAILURE;
     }
 
     // ---- Scenario 2: corrupt one element, assert SHOULD fire ----
@@ -131,6 +136,7 @@ int main(int argc, char **argv)
 
     printf("    Launching validation kernel...\n");
     printf("\n-- Begin assert output\n\n");
+    fflush(stdout);
     validate_monotonic_kernel<<<grid, block>>>(d_output, kN);
     getLastHggcError("validate_monotonic_kernel (corrupt) failed");
     hggcError_t status2 = hggcDeviceSynchronize();
@@ -140,19 +146,14 @@ int main(int argc, char **argv)
     if (status2 == hggcErrorAssert) {
         printf("    -> Device assert fired as expected (PASS)\n");
         pass = true;
-        // Clear the sticky error so subsequent API calls do not fail.
-        hggcGetLastError();
     } else {
         printf("    -> Expected hggcErrorAssert but got: %s (FAIL)\n",
                hggcGetErrorString(status2));
     }
 
-    // Cleanup. If the device assert fired the context is tainted;
-    // reset the device instead of calling individual hggcFree operations.
+    // The context is unusable after an assertion; cleanup is left to process exit, so the shared device is not reset.
     free(h_input);
-    if (pass) {
-        hggcDeviceReset();
-    } else {
+    if (status2 == hggcSuccess) {
         checkHggcErrors(hggcFree(d_input));
         checkHggcErrors(hggcFree(d_output));
     }

@@ -23,9 +23,9 @@ x86_64
 
 ## Supported PPU Architectures
 
-ppu001 only
+ppu001, ppu0015
 
-This sample uses AIU (`ppu.cp.async.aiu.*`) and Tensor Cell (`ppu.tc01.*`) instructions that are not supported on ppu0015.
+The AIU paths select the legacy 3D AIU/`tc01` form on ppu001 and the 2D tile AIU/`tc02` form on ppu0015.
 
 ## HGGC APIs Involved
 
